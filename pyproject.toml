@@ -17,6 +17,7 @@ dependencies = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",
     "transformers>=4.53.0",
+    "gigapath @ git+https://github.com/prov-gigapath/prov-gigapath.git@main",
 ]
 
 [tool.setuptools.packages.find]
