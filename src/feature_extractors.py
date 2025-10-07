@@ -2,6 +2,7 @@ import timm
 import torch.nn as nn
 import torch
 import torchvision.models as models
+from gigapath import slide_encoder
 
 
 from src.models import SimCLR
@@ -27,9 +28,11 @@ def vgg16(
     )
 
 
-def gigapath() -> nn.Module:
+def gigapathTile() -> nn.Module:
     return timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
 
+def gigapathSlide() -> nn.Module:
+    return slide_encoder.create_model("hf_hub:prov-gigapath/prov-gigapath", "gigapath_slide_enc12l768d", 1536)
 
 def simclr() -> nn.Module:
     model = SimCLR()
