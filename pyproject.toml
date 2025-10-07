@@ -17,6 +17,8 @@ dependencies = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",
     "transformers>=4.53.0",
+    "fairscale",
+    "flash-attn @ https://github.com/MiroPsota/torch_packages_builder/releases/download/flash_attn-2.8.3/flash_attn-2.8.3%2Bpt2.8.0cu129-cp312-cp312-linux_x86_64.whl",
     "gigapath @ git+https://github.com/prov-gigapath/prov-gigapath.git@main",
 ]
 

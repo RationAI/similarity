@@ -1,5 +1,7 @@
+import timm
+from PIL import Image
+from torchvision import transforms
 import torch
-from pathlib import Path
 from src.feature_extractors import gigapathTile, gigapathSlide
 
 tile_encoder = gigapathTile()
