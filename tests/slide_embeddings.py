@@ -7,6 +7,9 @@ import timm
 import torch.nn as nn
 import pyvips
 from src.feature_extractors import gigapathTile, gigapathSlide
+from tqdm import tqdm
+import numpy as np
+
 
 
 slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
@@ -47,6 +50,7 @@ for y in tqdm(range(0, level_0_height, TILE_SIZE)):
         
         # Check if the tile goes outside the slide boundary
         if x + TILE_SIZE > level_0_width or y + TILE_SIZE > level_0_height:
+            print("Outside of boundary")
             continue
         
         try:
@@ -87,6 +91,7 @@ for y in tqdm(range(0, level_0_height, TILE_SIZE)):
 
 # 4. Final Data Aggregation
 L = len(all_tile_embeddings)
+print(L)
 if L > 0:
     print(f"\n--- Aggregation Complete: {L} valid tiles found ---")
     
