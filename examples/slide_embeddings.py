@@ -40,7 +40,7 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
 def make_parquet(slide_path, save_path=""):
     full_save_path = save_path + slide_path.split("/")[-1].split(".")[0]
 
-    if len(os.listdir(full_save_path)) != 0:
+    if os.path.exists(full_save_path):
         print("Parquets already created, skipping.")
         return
         
