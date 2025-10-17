@@ -168,7 +168,7 @@ def save_tile_embeddings(save_path, tiles_df):
 def save_slide_embeddings(save_path, slide_df):
     if not os.path.exists(save_path):
         os.mkdir(save_path)
-    slide_df.to_parquet(save_path + "/slide.parquet", index=False)
+    slide_df.write_parquet(save_path + "/slide.parquet", index=False)
 
 
 def main() -> None:
