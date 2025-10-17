@@ -81,15 +81,16 @@ def create_slide_embeddings(slide_metadata, tiles_df, MODEL_DTYPE, device):
 
     slide_embedding = slide_encoder(final_input_tensor, final_coords_tensor)[0].squeeze().cpu().to(torch.float32).detach().numpy()
 
-    metadata_dict = slide_metadata.take(1)[0]
-    metadata_dict['embedding'] = slide_embedding
-
-    slide_metadata_updated = ray.data.from_items([metadata_dict])
-
     del slide_encoder
     torch.cuda.empty_cache()
 
-    return slide_metadata_updated
+    slide_metadata_df = slide_metadata.to_pandas()
+    slide_metadata_df['embedding'] = pd.Series([slide_embedding])
+
+    return slide_metadata_df # Vrací standardní Pandas DataFrame
+
+
+
 
 def encode_tiles_gigapath(batch: pd.DataFrame, slide: pyvips.Image, tile_encoder, transform, device, MODEL_DTYPE, TILE_SIZE):
     
@@ -168,7 +169,7 @@ def save_tile_embeddings(save_path, tiles_df):
 def save_slide_embeddings(save_path, slide_df):
     if not os.path.exists(save_path):
         os.mkdir(save_path)
-    slide_df.write_parquet(save_path + "/slide.parquet")
+    slide_df.to_parquet(save_path + "/slide.parquet", index=False)
 
 
 def main() -> None:
