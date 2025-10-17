@@ -79,7 +79,7 @@ def create_slide_embeddings(slide_metadata, tiles_df, MODEL_DTYPE, device):
     coords_tensor = torch.from_numpy(coords_numpy).to(torch.int64) 
     final_coords_tensor = coords_tensor.unsqueeze(0).to(device)
 
-    slide_embedding = slide_encoder(final_input_tensor, final_coords_tensor)[0].squeeze().cpu()
+    slide_embedding = slide_encoder(final_input_tensor, final_coords_tensor)[0].squeeze().cpu().detach().numpy()
 
     metadata_dict = slide_metadata.take(1)[0]
     metadata_dict['embedding'] = slide_embedding
