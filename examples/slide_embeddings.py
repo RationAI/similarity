@@ -79,7 +79,7 @@ def create_slide_embeddings(slide_metadata, tiles_df, MODEL_DTYPE, device):
     coords_tensor = torch.from_numpy(coords_numpy).to(torch.int64) 
     final_coords_tensor = coords_tensor.unsqueeze(0).to(device)
 
-    slide_embedding = slide_encoder(final_input_tensor, final_coords_tensor)
+    slide_embedding = slide_encoder(final_input_tensor, final_coords_tensor).squeeze()
 
     metadata_dict = slide_metadata.take(1)[0]
     metadata_dict['embedding'] = slide_embedding
@@ -161,11 +161,13 @@ def create_tile_embeddings(slide_path, device, MODEL_DTYPE, BATCH_SIZE, TILE_SIZ
     return output
 
 def save_tile_embeddings(save_path, tiles_df):
-    os.mkdir(save_path)
+    if not os.path.exists(save_path):
+        os.mkdir(save_path)
     tiles_df.to_parquet(save_path + "/tiles.parquet", index=False)
 
 def save_slide_embeddings(save_path, embeddings_df):
-    os.mkdir(save_path)
+    if not os.path.exists(save_path):
+        os.mkdir(save_path)
     tiles_df.to_parquet(save_path + "/slide.parquet", index=False)
 
 
