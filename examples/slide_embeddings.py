@@ -5,7 +5,9 @@ import os
 import argparse
 import pandas as pd
 import numpy as np
+import requests
 
+from tqdm import tqdm
 from PIL import Image
 from typing import Any
 from torchvision import transforms
@@ -87,8 +89,33 @@ def create_slide_embeddings(slide_metadata, tiles_df, MODEL_DTYPE, device):
     slide_metadata_df = slide_metadata.to_pandas()
     slide_metadata_df['embedding'] = pd.Series([slide_embedding])
 
-    return slide_metadata_df # Vrací standardní Pandas DataFrame
+    return slide_metadata_df
 
+def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, device):
+    embeddings_list_of_arrays = tiles_df['embedding'].to_list() 
+    embeddings_numpy = np.stack(embeddings_list_of_arrays).astype(np.float32)
+
+    x_coords = tiles_df['x_coord'].to_numpy()
+    y_coords = tiles_df['y_coord'].to_numpy()
+    coords_numpy = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
+
+    host = "http://rayservice-models-serve-svc.rationai-jobs-ns.svc.cluster.local:8000"
+    L = coords_numpy.shape[0]
+
+    payload = embeddings_numpy.tobytes() + coords_numpy.tobytes() 
+    url = f"{host}/gigapath-slide-encoder/{L}" 
+
+    r = requests.post( url, data=payload, headers={"Content-Type": "application/octet-stream"}, timeout=600, ) 
+    try: 
+        print("JSON resp:", r.json()) 
+    except Exception: 
+        print("Text resp:", r.text[:1000])
+
+    slide_metadata_df = slide_metadata.to_pandas()
+    slide_metadata_df['embedding'] = r.json()["embeddings"]
+
+
+    return slide_metadata_df
 
 
 
@@ -185,7 +212,7 @@ def process_slide(slide_path, save_path, device, MODEL_DTYPE):
 
     if (not os.path.exists(save_path + '/' + slide_name +"/slide.parquet")):
         print("\nStarting slide embeddings")
-        slide_embeddings = create_slide_embeddings(slide_metadata, tile_embeddings, MODEL_DTYPE, device)
+        slide_embeddings = create_slide_embeddings_service(slide_metadata, tile_embeddings, MODEL_DTYPE, device)
         print("\nSaving slide embeddings")
         save_slide_embeddings(save_path + '/' + slide_name, slide_embeddings)    
     else: 
@@ -216,9 +243,16 @@ def main() -> None:
     MODEL_DTYPE = torch.bfloat16
 
     if os.path.isdir(slide_path):
-        for slide in tqdm(os.listdir(slide_path)):
-            process_slide(slide, save_path, device, model)
+        for slide_name in tqdm(os.listdir(slide_path)):
+            absolute_path = os.path.join(slide_path, slide_name)
+            print(absolute_path)
+            if os.path.isdir(absolute_path):
+                continue
+            process_slide(absolute_path, save_path, device, MODEL_DTYPE)
         return
+
+    process_slide(slide_path, save_path, device, MODEL_DTYPE)
+
 
 
 if __name__ == "__main__":
