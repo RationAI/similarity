@@ -171,6 +171,25 @@ def save_slide_embeddings(save_path, slide_df):
         os.mkdir(save_path)
     slide_df.to_parquet(save_path + "/slide.parquet", index=False)
 
+def process_slide(slide_path, save_path, device, MODEL_DTYPE):
+    slide_metadata, tile_metadata = load_metadata(slide_path)
+    slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
+    if(not os.path.exists(save_path + '/' + slide_name)):
+        print("\nStarting tile embeddings")
+        tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, 256, 256)
+        print("\nSaving tile embeddings")
+        save_tile_embeddings(save_path + '/' + slide_name, tile_embeddings)
+    else:
+        print("\nTile embeddings already exists. Skipping")
+        tile_embeddings = load_parquet(save_path + '/' + slide_name)
+
+    if (not os.path.exists(save_path + '/' + slide_name +"/slide.parquet")):
+        print("\nStarting slide embeddings")
+        slide_embeddings = create_slide_embeddings(slide_metadata, tile_embeddings, MODEL_DTYPE, device)
+        print("\nSaving slide embeddings")
+        save_slide_embeddings(save_path + '/' + slide_name, slide_embeddings)    
+    else: 
+        print("\nSlide embeddings already exists. Skipping")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Creates tile and slide embeddings for WSI with help of Gigapath")
@@ -198,42 +217,8 @@ def main() -> None:
 
     if os.path.isdir(slide_path):
         for slide in tqdm(os.listdir(slide_path)):
-            slide_metadata, tile_metadata = load_metadata(slide_path)
-            slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
-
-            if(os.path.exists(save_path + '/' + slide_name)):
-                print("\nembeddings already exists. Skipping")
-                continue
-
-            print("/nStarting tile embeddings")
-            tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, 256, 256)
-            print("/nSaving tile embeddings")
-            save_tile_embeddings(save_path + '/' + slide_name, tile_embeddings)
-
-            print("/nStarting slide embeddings")
-            slide_embeddings = create_slide_embeddings(slide_metadata, tile_embeddings, MODEL_DTYPE, device)
-            print("/nSaving tile embeddings")
-            save_slide_embeddings(save_path + '/' + slide_name, slide_embeddings)
+            process_slide(slide, save_path, device, model)
         return
-
-    slide_metadata, tile_metadata = load_metadata(slide_path)
-    slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
-    if(not os.path.exists(save_path + '/' + slide_name)):
-        print("\nStarting tile embeddings")
-        tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, 256, 256)
-        print("\nSaving tile embeddings")
-        save_tile_embeddings(save_path + '/' + slide_name, tile_embeddings)
-    else:
-        print("\nTile embeddings already exists. Skipping")
-        tile_embeddings = load_parquet(save_path + '/' + slide_name)
-
-    if (not os.path.exists(save_path + '/' + slide_name +"/slide.parquet")):
-        print("/nStarting slide embeddings")
-        slide_embeddings = create_slide_embeddings(slide_metadata, tile_embeddings, MODEL_DTYPE, device)
-        print("/nSaving slide embeddings")
-        save_slide_embeddings(save_path + '/' + slide_name, slide_embeddings)    
-    else: 
-        print("\nSlide embeddings already exists. Skipping")
 
 
 if __name__ == "__main__":
