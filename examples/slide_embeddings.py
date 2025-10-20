@@ -14,7 +14,7 @@ from torchvision import transforms
 from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
-from src.feature_extractors import gigapathTile, gigapathSlide
+from src.feature_extractors import gigapathTile
 
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
