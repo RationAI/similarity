@@ -58,39 +58,6 @@ def load_parquet(path):
     data = pd.read_parquet(path)
     return data
 
-def print_parquets(path): 
-    p = load_parquet(path)
-    print(p.count())
-    print(p.take(1))
-    return 
-
-def create_slide_embeddings(slide_metadata, tiles_df, MODEL_DTYPE, device):
-    slide_encoder = gigapathSlide()
-    slide_encoder = slide_encoder.to(MODEL_DTYPE)
-    slide_encoder = slide_encoder.to(device)
-
-    embeddings_list_of_arrays = tiles_df['embedding'].to_list() 
-    embeddings_numpy = np.stack(embeddings_list_of_arrays)
-    embeddings_tensor = torch.from_numpy(embeddings_numpy).to(MODEL_DTYPE).to(device)
-    final_input_tensor = embeddings_tensor.unsqueeze(0)
-
-
-    x_coords = tiles_df['x_coord'].to_numpy()
-    y_coords = tiles_df['y_coord'].to_numpy()
-    coords_numpy = np.stack([x_coords, y_coords], axis=1).astype(np.int64)
-    coords_tensor = torch.from_numpy(coords_numpy).to(torch.int64) 
-    final_coords_tensor = coords_tensor.unsqueeze(0).to(device)
-
-    slide_embedding = slide_encoder(final_input_tensor, final_coords_tensor)[0].squeeze().cpu().to(torch.float32).detach().numpy()
-
-    del slide_encoder
-    torch.cuda.empty_cache()
-
-    slide_metadata_df = slide_metadata.to_pandas()
-    slide_metadata_df['embedding'] = pd.Series([slide_embedding])
-
-    return slide_metadata_df
-
 def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, device):
     embeddings_list_of_arrays = tiles_df['embedding'].to_list() 
     embeddings_numpy = np.stack(embeddings_list_of_arrays).astype(np.float32)
@@ -109,7 +76,8 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, devic
     try: 
         print("JSON resp:", r.json()) 
     except Exception: 
-        print("Text resp:", r.text[:1000])
+        print("ERROR: gigapath service not answering.")
+        raise
 
     slide_metadata_df = slide_metadata.to_pandas()
     slide_metadata_df['embedding'] = r.json()["embeddings"]
@@ -119,12 +87,13 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, devic
 
 
 
-def encode_tiles_gigapath(batch: pd.DataFrame, slide: pyvips.Image, tile_encoder, transform, device, MODEL_DTYPE, TILE_SIZE):
+def encode_tiles_gigapath(batch: pd.DataFrame, slide_path, tile_encoder, transform, device, MODEL_DTYPE, TILE_SIZE):
     
     x_coords = batch['tile_x']
     y_coords = batch['tile_y']
     coords = zip(x_coords, y_coords)
-    
+    slide = pyvips.Image.new_from_file(slide_path)
+
     batch_of_inputs = []
     
     for x, y in coords:
@@ -161,8 +130,6 @@ def create_tile_embeddings(slide_path, device, MODEL_DTYPE, BATCH_SIZE, TILE_SIZ
     tile_encoder = tile_encoder.to(device)
     tile_encoder = tile_encoder.to(torch.bfloat16)
     tile_encoder.eval()
-
-    slide = pyvips.Image.new_from_file(slide_path)
     
     transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -173,12 +140,22 @@ def create_tile_embeddings(slide_path, device, MODEL_DTYPE, BATCH_SIZE, TILE_SIZ
 
     slide_metadata, tiles_metadata = load_metadata(slide_path)
     
-    batch_iterator = tiles_metadata.iter_batches(batch_size=BATCH_SIZE)
+    result_ds = tiles_metadata.map_batches(
+        encode_tiles_gigapath,
+        fn_kwargs={
+            "slide_path": slide_path,
+            "tile_encoder": tile_encoder,
+            "transform": transform,
+            "device": device,
+            "MODEL_DTYPE": MODEL_DTYPE,
+            "TILE_SIZE": TILE_SIZE
+        },
+        num_gpus=1,
+        batch_size=BATCH_SIZE,
+    )
     all_result_dfs = []
-    
-    for b in batch_iterator:
-        e = encode_tiles_gigapath(b, slide, tile_encoder, transform, device, MODEL_DTYPE, TILE_SIZE)
-        all_result_dfs.append(e)
+    for result_batch in result_ds.iter_batches(batch_format="pandas"):
+        all_result_dfs.append(result_batch)
     
     output = pd.concat(all_result_dfs, ignore_index=True)
 
@@ -198,12 +175,12 @@ def save_slide_embeddings(save_path, slide_df):
         os.mkdir(save_path)
     slide_df.to_parquet(save_path + "/slide.parquet", index=False)
 
-def process_slide(slide_path, save_path, device, MODEL_DTYPE):
+def process_slide(slide_path, save_path, device, MODEL_DTYPE, BATCH_SIZE):
     slide_metadata, tile_metadata = load_metadata(slide_path)
     slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
     if(not os.path.exists(save_path + '/' + slide_name)):
         print("\nStarting tile embeddings")
-        tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, 256, 256)
+        tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, BATCH_SIZE, 256)
         print("\nSaving tile embeddings")
         save_tile_embeddings(save_path + '/' + slide_name, tile_embeddings)
     else:
@@ -234,6 +211,13 @@ def main() -> None:
         default='./',
         help='Path for saving parquet files, folder for each WSI will be created automatically.'
     )
+    
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=128,
+        help="Batch size for tiling."
+    )
     args = parser.parse_args()
 
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
@@ -241,6 +225,7 @@ def main() -> None:
     save_path = args.save_path.rstrip('/')
     device = torch.device("cuda")
     MODEL_DTYPE = torch.bfloat16
+    BATCH_SIZE = args.batch_size
 
     if os.path.isdir(slide_path):
         for slide_name in tqdm(os.listdir(slide_path)):
@@ -248,10 +233,10 @@ def main() -> None:
             print(absolute_path)
             if os.path.isdir(absolute_path):
                 continue
-            process_slide(absolute_path, save_path, device, MODEL_DTYPE)
+            process_slide(absolute_path, save_path, device, MODEL_DTYPE, BATCH_SIZE)
         return
 
-    process_slide(slide_path, save_path, device, MODEL_DTYPE)
+    process_slide(slide_path, save_path, device, MODEL_DTYPE, BATCH_SIZE)
 
 
 
