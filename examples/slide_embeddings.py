@@ -1,3 +1,4 @@
+import openslide
 import pyvips
 import torch
 import ray
@@ -81,89 +82,91 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, devic
         print("ERROR: gigapath service not answering.")
         raise
 
+    return slide_metadata_df    
 
+class TileEncoderActor:
+    def __init__(self, device: torch.device, model_dtype: torch.dtype, slide_path: str):
+        import openslide
+        import pyvips
 
-    return slide_metadata_df
+        self.device = device
+        self.model_dtype = model_dtype
+        self.slide = pyvips.Image.new_from_file(slide_path)
 
+        
+        tile_encoder = gigapathTile()
+        tile_encoder = tile_encoder.to(device)
+        tile_encoder = tile_encoder.to(torch.bfloat16)
+        tile_encoder.eval()
 
+        self.tile_encoder = tile_encoder()
 
-def encode_tiles_gigapath(batch: pd.DataFrame, slide_path, tile_encoder, transform, device, MODEL_DTYPE, TILE_SIZE):
-    
-    x_coords = batch['tile_x']
-    y_coords = batch['tile_y']
-    coords = zip(x_coords, y_coords)
-    slide = pyvips.Image.new_from_file(slide_path)
-
-    batch_of_inputs = []
-    
-    for x, y in coords:
-        patch_vips = slide.extract_area(int(x), int(y), TILE_SIZE, TILE_SIZE) 
-        patch_array = np.asarray(patch_vips.numpy())[:, :, :3] 
-
-        patch_pil = Image.fromarray(patch_array)
-        sample_input = transform(patch_pil)
-        batch_of_inputs.append(sample_input)
-
-    batch_tensor = torch.stack(batch_of_inputs) 
-    final_input_tensor = batch_tensor.to(device).to(MODEL_DTYPE)
-
-    with torch.no_grad():
-        embeddings_tensor = tile_encoder(final_input_tensor).squeeze()
-
-    embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
-    embeddings_list = list(embeddings_array)
-    
-    del embeddings_tensor
-    del final_input_tensor
-    torch.cuda.empty_cache()
-
-    output_df = pd.DataFrame({
-        'slide_id': batch["slide_id"],
-        'x_coord': x_coords,
-        'y_coord': y_coords,
-        'embedding': embeddings_list,
-    })
-    return output_df
-
-def create_tile_embeddings(slide_path, device, MODEL_DTYPE, BATCH_SIZE, TILE_SIZE):
-    tile_encoder = gigapathTile()
-    tile_encoder = tile_encoder.to(device)
-    tile_encoder = tile_encoder.to(torch.bfloat16)
-    tile_encoder.eval()
-    
-    transform = transforms.Compose([
+        self.transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ])
+        ])
 
+    def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
+        x_coords = batch['tile_x']
+        y_coords = batch['tile_y']
+        coords = zip(x_coords, y_coords)
+
+        batch_of_inputs = []
+        
+        for x, y in coords:
+            patch_vips = self.slide.extract_area(int(x), int(y), 256, 256) 
+            patch_array = np.asarray(patch_vips.numpy())[:, :, :3] 
+
+            patch_pil = Image.fromarray(patch_array)
+            sample_input = self.transform(patch_pil)
+            batch_of_inputs.append(sample_input)
+
+        batch_tensor = torch.stack(batch_of_inputs) 
+        final_input_tensor = batch_tensor.to(self.device).to(self.model_dtype)
+
+        with torch.no_grad():
+            embeddings_tensor = self.tile_encoder(final_input_tensor).squeeze()
+
+        embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
+        embeddings_list = list(embeddings_array)
+        
+        del embeddings_tensor
+        del final_input_tensor
+        torch.cuda.empty_cache()
+
+        output_df = pd.DataFrame({
+            'slide_id': batch["slide_id"],
+            'x_coord': x_coords,
+            'y_coord': y_coords,
+            'embedding': embeddings_list,
+        })
+        return output_df
+
+def create_tile_embeddings(slide_path, device, model_dtype, batch_size, tile_size):
     slide_metadata, tiles_metadata = load_metadata(slide_path)
-    
     result_ds = tiles_metadata.map_batches(
-        encode_tiles_gigapath,
-        fn_kwargs={
-            "slide_path": slide_path,
-            "tile_encoder": tile_encoder,
-            "transform": transform,
+        TileEncoderActor,
+        fn_constructor_kwargs={
             "device": device,
-            "MODEL_DTYPE": MODEL_DTYPE,
-            "TILE_SIZE": TILE_SIZE
+            "model_dtype": model_dtype,
+            "slide_path": slide_path
         },
-        num_gpus=1,
-        batch_size=BATCH_SIZE,
+        num_gpus=1 if device.type == "cuda" else 0,
+        batch_size=batch_size,
+        compute=ray.data.ActorPoolStrategy()
     )
+    print("Processing batches...")
     all_result_dfs = []
     for result_batch in result_ds.iter_batches(batch_format="pandas"):
         all_result_dfs.append(result_batch)
-    
-    output = pd.concat(all_result_dfs, ignore_index=True)
+    print("Processing finished.")
 
-    del slide
-    del tile_encoder
-    torch.cuda.empty_cache()
+    if not all_result_dfs:
+        return pd.DataFrame() # Vrátíme prázdný DataFrame, pokud nebyly žádné výsledky
 
-    return output
+    return pd.concat(all_result_dfs, ignore_index=True)
 
 def save_tile_embeddings(save_path, tiles_df):
     if not os.path.exists(save_path):
@@ -241,4 +244,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    ray.init(
+        runtime_env={
+            "env_vars": {
+                "LD_LIBRARY_PATH": f"/home/linuxbrew/.linuxbrew/lib:{os.environ.get('LD_LIBRARY_PATH', '')}"
+            }
+        }
+    )
     main()
