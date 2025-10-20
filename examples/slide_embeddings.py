@@ -72,15 +72,15 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, devic
     payload = embeddings_numpy.tobytes() + coords_numpy.tobytes() 
     url = f"{host}/gigapath-slide-encoder/{L}" 
 
+    slide_metadata_df = slide_metadata.to_pandas()
     r = requests.post( url, data=payload, headers={"Content-Type": "application/octet-stream"}, timeout=600, ) 
+
     try: 
-        print("JSON resp:", r.json()) 
+        slide_metadata_df['embedding'] = r.json()["embeddings"]
     except Exception: 
         print("ERROR: gigapath service not answering.")
         raise
 
-    slide_metadata_df = slide_metadata.to_pandas()
-    slide_metadata_df['embedding'] = r.json()["embeddings"]
 
 
     return slide_metadata_df
