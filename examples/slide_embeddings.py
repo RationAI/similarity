@@ -7,6 +7,7 @@ import argparse
 import pandas as pd
 import numpy as np
 import requests
+import time
 
 from tqdm import tqdm
 from PIL import Image
@@ -17,6 +18,82 @@ from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from src.feature_extractors import gigapathTile
 
+
+def get_sensible_worker_config():
+    """
+    Pokusí se detekovat vlastnosti systému a navrhnout
+    rozumnou výchozí konfiguraci pro počet workerů.
+    """
+    if not torch.cuda.is_available():
+        return 1, 4096
+
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    
+    print(f"Detekována GPU s {vram_gb:.1f} GB VRAM.")
+    estimated_vram_per_worker_gb = 3
+    available_vram_for_workers = vram_gb - 1.0 
+    num_workers = int(available_vram_for_workers / estimated_vram_per_worker_gb)
+    
+    num_workers = max(1, min(16, num_workers)) 
+
+    rows_per_block = 4096 * (num_workers // 2)
+    rows_per_block = max(4096, min(32768, rows_per_block))
+
+    print(f"Navrhovaná konfigurace: {num_workers} workerů/GPU, {rows_per_block} řádků/blok.")
+    return num_workers, rows_per_block
+
+def profile_and_get_auto_batch_size(model_class, model_dtype, num_workers):
+    """
+    Spustí 'suchý běh' pro změření reálné spotřeby VRAM a určí optimální batch_size.
+    """
+    if not torch.cuda.is_available():
+        return 128
+
+    print("Spouštím profilování VRAM pro automatické nastavení batch_size...")
+
+    # Připravíme model a dummy data
+    device = torch.device("cuda")
+    model = model_class().to(device).to(model_dtype).eval()
+    
+    # Velikost dávky, na které budeme testovat (musí být malá)
+    profile_batch_size = 32 
+    dummy_input = torch.randn(profile_batch_size, 3, 224, 224, device=device, dtype=model_dtype)
+
+    # Změříme paměť obsazenou jen modelem
+    torch.cuda.empty_cache()
+    vram_model_only = torch.cuda.memory_allocated(device)
+
+    # Spustíme forward pass a změříme PEAK paměť
+    with torch.no_grad():
+        model(dummy_input)
+    
+    vram_peak_with_batch = torch.cuda.max_memory_allocated(device)
+    del dummy_input, model # Uvolníme paměť
+    torch.cuda.empty_cache()
+
+    # Vypočítáme, kolik paměti navíc spotřebovala jedna dávka (včetně aktivací)
+    vram_for_one_batch = vram_peak_with_batch - vram_model_only
+    vram_per_item = vram_for_one_batch / profile_batch_size
+
+    # Nyní uděláme finální výpočet
+    vram_total = torch.cuda.get_device_properties(0).total_memory
+    vram_reserved = 1.0 * (1024**3) # Menší rezerva stačí, protože měření je přesnější
+    vram_available = vram_total - vram_reserved
+    vram_for_all_models = vram_model_only * num_workers
+    
+    vram_for_all_batches = vram_available - vram_for_all_models
+    if vram_for_all_batches <= 0:
+        raise MemoryError("Není dostatek VRAM ani pro nahrání všech modelů.")
+        
+    vram_per_worker_for_batch = vram_for_all_batches / num_workers
+    
+    max_batch_size = int(vram_per_worker_for_batch / vram_per_item)
+    
+    # Zarovnání na nejbližší (nižší) mocninu 2
+    safe_batch_size = 2**int(np.log2(max_batch_size))
+    
+    print(f"Profilování dokončeno. Navrhovaný BATCH_SIZE_PER_WORKER: {safe_batch_size}")
+    return max(32, safe_batch_size)
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
@@ -38,12 +115,12 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def load_metadata(slide_path):   
+def load_metadata(slide_path, ROWS_PER_BLOCK):   
     slides = read_slides(slide_path, mpp=0.25, tile_extent=256, stride=256)
     slides = slides.map(row_hash, num_cpus=0.1, memory=128 * 1024**2)
 
     tiles = slides.flat_map(tiling, num_cpus=0.2, memory=128 * 1024**2).repartition(
-        target_num_rows_per_block=4096
+        target_num_rows_per_block=ROWS_PER_BLOCK
     )
 
     tissue_tiles = tiles.map_batches(
@@ -86,9 +163,6 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, devic
 
 class TileEncoderActor:
     def __init__(self, device: torch.device, model_dtype: torch.dtype, slide_path: str):
-        import openslide
-        import pyvips
-
         self.device = device
         self.model_dtype = model_dtype
         self.slide = pyvips.Image.new_from_file(slide_path)
@@ -99,7 +173,7 @@ class TileEncoderActor:
         tile_encoder = tile_encoder.to(torch.bfloat16)
         tile_encoder.eval()
 
-        self.tile_encoder = tile_encoder()
+        self.tile_encoder = tile_encoder
 
         self.transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -127,7 +201,7 @@ class TileEncoderActor:
         final_input_tensor = batch_tensor.to(self.device).to(self.model_dtype)
 
         with torch.no_grad():
-            embeddings_tensor = self.tile_encoder(final_input_tensor).squeeze()
+            embeddings_tensor = self.tile_encoder(final_input_tensor)
 
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
         embeddings_list = list(embeddings_array)
@@ -144,8 +218,20 @@ class TileEncoderActor:
         })
         return output_df
 
-def create_tile_embeddings(slide_path, device, model_dtype, batch_size, tile_size):
-    slide_metadata, tiles_metadata = load_metadata(slide_path)
+def create_tile_embeddings(slide_path, device, model_dtype, tile_size, BATCH_SIZE, NUM_WORKERS, ROWS_PER_BLOCK):
+    slide_metadata, tiles_metadata = load_metadata(slide_path, ROWS_PER_BLOCK)
+
+    # needed for right pyvips integration of workers
+    PRELOAD_LIB_PATH = "/home/linuxbrew/.linuxbrew/lib/libjpeg.so.8" 
+    ld_library_path = "/home/linuxbrew/.linuxbrew/lib"
+
+    runtime_env = {
+        "env_vars": {
+            "LD_LIBRARY_PATH": f"{ld_library_path}:{os.environ.get('LD_LIBRARY_PATH', '')}",
+            "LD_PRELOAD": PRELOAD_LIB_PATH
+        }
+    }
+
     result_ds = tiles_metadata.map_batches(
         TileEncoderActor,
         fn_constructor_kwargs={
@@ -153,9 +239,10 @@ def create_tile_embeddings(slide_path, device, model_dtype, batch_size, tile_siz
             "model_dtype": model_dtype,
             "slide_path": slide_path
         },
-        num_gpus=1 if device.type == "cuda" else 0,
-        batch_size=batch_size,
-        compute=ray.data.ActorPoolStrategy()
+        num_gpus=1.0/NUM_WORKERS if device.type == "cuda" else 0,
+        batch_size=BATCH_SIZE,
+        compute=ray.data.ActorPoolStrategy(),
+        runtime_env=runtime_env,
     )
     print("Processing batches...")
     all_result_dfs = []
@@ -164,7 +251,7 @@ def create_tile_embeddings(slide_path, device, model_dtype, batch_size, tile_siz
     print("Processing finished.")
 
     if not all_result_dfs:
-        return pd.DataFrame() # Vrátíme prázdný DataFrame, pokud nebyly žádné výsledky
+        return pd.DataFrame()
 
     return pd.concat(all_result_dfs, ignore_index=True)
 
@@ -178,12 +265,12 @@ def save_slide_embeddings(save_path, slide_df):
         os.mkdir(save_path)
     slide_df.to_parquet(save_path + "/slide.parquet", index=False)
 
-def process_slide(slide_path, save_path, device, MODEL_DTYPE, BATCH_SIZE):
-    slide_metadata, tile_metadata = load_metadata(slide_path)
+def process_slide(slide_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE):
+    slide_metadata, tile_metadata = load_metadata(slide_path, ROWS_PER_BLOCK)
     slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
     if(not os.path.exists(save_path + '/' + slide_name)):
         print("\nStarting tile embeddings")
-        tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, BATCH_SIZE, 256)
+        tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, ROWS_PER_BLOCK)
         print("\nSaving tile embeddings")
         save_tile_embeddings(save_path + '/' + slide_name, tile_embeddings)
     else:
@@ -214,21 +301,21 @@ def main() -> None:
         default='./',
         help='Path for saving parquet files, folder for each WSI will be created automatically.'
     )
-    
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=128,
-        help="Batch size for tiling."
-    )
+
     args = parser.parse_args()
+
 
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
     slide_path = args.slide_path
     save_path = args.save_path.rstrip('/')
     device = torch.device("cuda")
     MODEL_DTYPE = torch.bfloat16
-    BATCH_SIZE = args.batch_size
+
+    NUM_WORKERS, ROWS_PER_BLOCK = get_sensible_worker_config()
+    BATCH_SIZE = profile_and_get_auto_batch_size(gigapathTile, MODEL_DTYPE, NUM_WORKERS)
+
+
+    start_time = time.time()
 
     if os.path.isdir(slide_path):
         for slide_name in tqdm(os.listdir(slide_path)):
@@ -236,19 +323,18 @@ def main() -> None:
             print(absolute_path)
             if os.path.isdir(absolute_path):
                 continue
-            process_slide(absolute_path, save_path, device, MODEL_DTYPE, BATCH_SIZE)
+            process_slide(absolute_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE)
         return
 
-    process_slide(slide_path, save_path, device, MODEL_DTYPE, BATCH_SIZE)
+    process_slide(slide_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE)
 
+    end_time = time.time()
+    
+    elapsed_time = end_time - start_time
+    print(f"=============================================")
+    print(f"Celkový čas zpracování: {elapsed_time:.2f} sekund")
+    print(f"=============================================")
 
 
 if __name__ == "__main__":
-    ray.init(
-        runtime_env={
-            "env_vars": {
-                "LD_LIBRARY_PATH": f"/home/linuxbrew/.linuxbrew/lib:{os.environ.get('LD_LIBRARY_PATH', '')}"
-            }
-        }
-    )
     main()
