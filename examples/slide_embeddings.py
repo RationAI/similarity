@@ -162,12 +162,16 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, devic
     return slide_metadata_df    
 
 class TileEncoderActor:
-    def __init__(self, device: torch.device, model_dtype: torch.dtype, slide_path: str, model):
+    def __init__(self, device: torch.device, model_dtype: torch.dtype, slide_path: str):
         self.device = device
         self.model_dtype = model_dtype
         self.slide = pyvips.Image.new_from_file(slide_path)
 
-        self.tile_encoder = ray.get(model)
+        tile_encoder = gigapathTile()
+        tile_encoder = tile_encoder.to(device)
+        tile_encoder = tile_encoder.to(model_dtype)
+        tile_encoder.eval()
+        self.tile_encoder = tile_encoder
 
         self.transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -226,20 +230,12 @@ def create_tile_embeddings(slide_path, device, model_dtype, tile_size, BATCH_SIZ
         }
     }
 
-    tile_encoder = gigapathTile()
-    tile_encoder = tile_encoder.to(device)
-    tile_encoder = tile_encoder.to(model_dtype)
-    tile_encoder.eval()
-    
-    model_ref = ray.put(tile_encoder)
-
     result_ds = tiles_metadata.map_batches(
         TileEncoderActor,
         fn_constructor_kwargs={
             "device": device,
             "model_dtype": model_dtype,
             "slide_path": slide_path,
-            "model": model_ref,
         },
         num_gpus=1.0/NUM_WORKERS if device.type == "cuda" else 0,
         memory=7*1024**3,
