@@ -242,7 +242,7 @@ def create_tile_embeddings(slide_path, device, model_dtype, tile_size, BATCH_SIZ
         num_gpus=1.0/NUM_WORKERS if device.type == "cuda" else 0,
         memory=7*1024**3,
         batch_size=BATCH_SIZE,
-        compute=ray.data.ActorPoolStrategy(size=NUM_GPU_WORKERS),
+        compute=ray.data.ActorPoolStrategy(size=NUM_WORKERS),
         runtime_env=runtime_env,
     )
     print("Processing batches...")
