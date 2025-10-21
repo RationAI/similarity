@@ -30,7 +30,7 @@ def get_sensible_worker_config():
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     
     print(f"Detekována GPU s {vram_gb:.1f} GB VRAM.")
-    estimated_vram_per_worker_gb = 3
+    estimated_vram_per_worker_gb = 5
     available_vram_for_workers = vram_gb - 1.0 
     num_workers = int(available_vram_for_workers / estimated_vram_per_worker_gb)
     
