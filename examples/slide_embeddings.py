@@ -240,6 +240,7 @@ def create_tile_embeddings(slide_path, device, model_dtype, tile_size, BATCH_SIZ
             "slide_path": slide_path
         },
         num_gpus=1.0/NUM_WORKERS if device.type == "cuda" else 0,
+        memory=6*1024**3,
         batch_size=BATCH_SIZE,
         compute=ray.data.ActorPoolStrategy(),
         runtime_env=runtime_env,
