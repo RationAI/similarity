@@ -34,7 +34,7 @@ def get_sensible_worker_config():
     available_vram_for_workers = vram_gb - 1.0 
     num_workers = int(available_vram_for_workers / estimated_vram_per_worker_gb)
     
-    num_workers = max(1, min(16, num_workers)) 
+    num_workers = max(1, num_workers) 
 
     rows_per_block = 4096 * (num_workers // 2)
     rows_per_block = max(4096, min(32768, rows_per_block))
