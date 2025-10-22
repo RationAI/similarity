@@ -123,9 +123,9 @@ def load_metadata(slide_path, ROWS_PER_BLOCK):
         target_num_rows_per_block=ROWS_PER_BLOCK
     )
 
-    tissue_tiles = tiles.map_batches(
-        read_slide_tiles, num_cpus=1, memory=5 * 1024**3
-    ).filter(lambda row: row["tile"].std() > 8)
+    tissue_tiles = tiles.window(blocks_per_window=4).map_batches( 
+        read_slide_tiles, num_cpus=2, memory=5 * 1024**3
+    ).filter(lambda row: row["tile"].std() > 8).overall_window(blocks_per_window=4) 
 
     tissue_tiles = tissue_tiles.drop_columns(
         ["tile", "level", "tile_extent_x", "tile_extent_y"], memory = 3 * 1024**3
@@ -243,16 +243,7 @@ def create_tile_embeddings(slide_path, device, model_dtype, tile_size, BATCH_SIZ
         compute=ray.data.ActorPoolStrategy(size=NUM_WORKERS),
         runtime_env=runtime_env,
     )
-    print("Processing batches...")
-    all_result_dfs = []
-    for result_batch in result_ds.iter_batches(batch_format="pandas"):
-        all_result_dfs.append(result_batch)
-    print("Processing finished.")
-
-    if not all_result_dfs:
-        return pd.DataFrame()
-
-    return pd.concat(all_result_dfs, ignore_index=True)
+    return result_ds.to_pandas()
 
 def save_tile_embeddings(save_path, tiles_df):
     if not os.path.exists(save_path):
