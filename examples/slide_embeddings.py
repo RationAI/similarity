@@ -117,18 +117,18 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 def load_metadata(slide_path, ROWS_PER_BLOCK):   
     slides = read_slides(slide_path, mpp=0.25, tile_extent=256, stride=256)
-    slides = slides.map(row_hash, num_cpus=0.1, memory=128 * 1024**2)
+    slides = slides.map(row_hash, num_cpus=0.1, memory=3 * 1024**3)
 
-    tiles = slides.flat_map(tiling, num_cpus=0.2, memory=128 * 1024**2).repartition(
+    tiles = slides.flat_map(tiling, num_cpus=0.2, memory=3 * 1024**3).repartition(
         target_num_rows_per_block=ROWS_PER_BLOCK
     )
 
     tissue_tiles = tiles.map_batches(
-        read_slide_tiles, num_cpus=1, memory=4 * 1024**3
+        read_slide_tiles, num_cpus=1, memory=5 * 1024**3
     ).filter(lambda row: row["tile"].std() > 8)
 
     tissue_tiles = tissue_tiles.drop_columns(
-        ["tile", "level", "tile_extent_x", "tile_extent_y"]
+        ["tile", "level", "tile_extent_x", "tile_extent_y"], memory = 3 * 1024**3
     )
     return (slides, tissue_tiles)
 
