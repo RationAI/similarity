@@ -231,7 +231,7 @@ def main() -> None:
     MODEL_DTYPE = torch.bfloat16
     DEVICE = torch.device("cuda")
     NUM_WORKERS = args.workers
-    SLIDE_COUNT = 1
+    SLIDE_COUNT = 0
 
     # disclaimer: based on testing, can be wrong
     MODEL_SIZE_GB = 4.8
@@ -253,16 +253,16 @@ def main() -> None:
 
     start_time = time.time()
     if os.path.isdir(slide_path):
-        SLIDE_COUNT = os.listdir(slide_path).len()
         for slide_name in os.listdir(slide_path):
             absolute_path = os.path.join(slide_path, slide_name)
             print(absolute_path)
             if os.path.isdir(absolute_path):
                 continue
+            SLIDE_COUNT += 1
             process_slide(absolute_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE)
     else:
         process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE)
-
+        SLIDE_COUNT += 1
     end_time = time.time()
     
     elapsed_time = end_time - start_time
