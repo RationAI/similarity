@@ -254,16 +254,16 @@ def main() -> None:
     NUM_WORKERS = args.workers
 
     # disclaimer: based on testing, can be wrong
-    MODEL_SIZE_GB = 2.13
-    ONE_BATCH_SIZE_GB = 0.0085 # size of 1 tile 256x256 
-    OVERHEAD = 6 # for pytorch and os stuff
+    MODEL_SIZE_GB = 4.8
+    ONE_BATCH_SIZE_GB = 0.0113  # size of 1 tile 256x256
+    OVERHEAD = 2 # for pytorch and os stuff
 
     VRAM_PER_WORKER = ((BATCH_SIZE * ONE_BATCH_SIZE_GB) + MODEL_SIZE_GB)
 
     TOTAL_VRAM = torch.cuda.get_device_properties(device).total_memory / 1024**3
 
     if (NUM_WORKERS == 0):
-        NUM_WORKERS = int((TOTAL_VRAM - OVERHEAD) // VRAM_PER_WORKER)
+        NUM_WORKERS = int((TOTAL_VRAM) // VRAM_PER_WORKER)
 
     print(f"Number of workers: {NUM_WORKERS:.2f}")
     print(f"total vram: {TOTAL_VRAM:.2f}")
