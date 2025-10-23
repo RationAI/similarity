@@ -129,7 +129,7 @@ class TileEncoderActor:
             embeddings_tensor = self.tile_encoder(final_input_tensor)
 
             vram_used = torch.cuda.max_memory_allocated(device=self.device)
-            TOTAL_VRAM = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            TOTAL_VRAM = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
             print(f"Maximal allocated VRAM: {vram_used / 1024**3:.2f} GB")
             print(f"Total VRAM: {TOTAL_VRAM} GB")
 
