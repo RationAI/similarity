@@ -255,7 +255,6 @@ def main() -> None:
     if os.path.isdir(slide_path):
         for slide_name in os.listdir(slide_path):
             absolute_path = os.path.join(slide_path, slide_name)
-            print(absolute_path)
             if os.path.isdir(absolute_path):
                 continue
             SLIDE_COUNT += 1
