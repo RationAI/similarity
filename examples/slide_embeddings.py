@@ -121,11 +121,12 @@ class TileEncoderActor:
             batch_of_inputs.append(sample_input)
 
         batch_tensor = torch.stack(batch_of_inputs) 
+
+        torch.cuda.reset_peak_memory_stats(device=self.device)
+
         final_input_tensor = batch_tensor.to(self.device).to(self.model_dtype)
 
         with torch.no_grad():
-            torch.cuda.reset_peak_memory_stats(device=self.device)
-
             embeddings_tensor = self.tile_encoder(final_input_tensor)
 
             vram_used = torch.cuda.max_memory_allocated(device=self.device)
