@@ -53,7 +53,7 @@ def load_metadata(slide_path, ROWS_PER_BLOCK):
     ).filter(lambda row: row["tile"].std() > 8)
 
     tissue_tiles = tissue_tiles.drop_columns(
-        ["tile", "level", "tile_extent_x", "tile_extent_y"], memory = 3 * 1024**3
+        ["level", "tile_extent_x", "tile_extent_y"], memory = 3 * 1024**3
     )
     return (slides, tissue_tiles)
 
@@ -108,19 +108,24 @@ class TileEncoderActor:
     def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
         x_coords = batch['tile_x']
         y_coords = batch['tile_y']
-        coords = zip(x_coords, y_coords)
-
-        batch_of_inputs = []
+        # Seznam pro uložení transformovaných tenzorů
+        transformed_tiles = []
         
-        for x, y in coords:
-            patch_vips = self.slide.extract_area(int(x), int(y), 256, 256) 
-            patch_array = np.asarray(patch_vips.numpy())[:, :, :3] 
-
-            patch_pil = Image.fromarray(patch_array)
-            sample_input = self.transform(patch_pil)
-            batch_of_inputs.append(sample_input)
-
-        batch_tensor = torch.stack(batch_of_inputs) 
+        # Iterujeme přes surové obrázky v dávce
+        for tile_data in batch['tile']:
+            # Krok 1: Ujistíme se, že máme PIL Image
+            # (potřebné pro torchvision.transforms)
+            # Pokud jsou `tile_data` již NumPy pole, toto je převede.
+            pil_image = Image.fromarray(tile_data)
+            
+            # Krok 2: Aplikujeme transformace
+            # Výstupem je již hotový tenzor ve formátu CHW se správnou normalizací
+            tensor = self.transform(pil_image)
+            transformed_tiles.append(tensor)
+            
+        # Krok 3: Spojíme seznam tenzorů do jedné velké dávky
+        # torch.stack vytvoří novou dimenzi na začátku pro dávku (Batch, C, H, W)
+        batch_tensor = torch.stack(transformed_tiles)
 
         torch.cuda.reset_peak_memory_stats(device=self.device)
 
@@ -130,9 +135,7 @@ class TileEncoderActor:
             embeddings_tensor = self.tile_encoder(final_input_tensor)
 
             vram_used = torch.cuda.max_memory_allocated(device=self.device)
-            TOTAL_VRAM = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
             print(f"Maximal allocated VRAM: {vram_used / 1024**3:.2f} GB")
-            print(f"Total VRAM: {TOTAL_VRAM} GB")
 
 
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
@@ -171,8 +174,7 @@ def create_tile_embeddings(slide_path, device, model_dtype, tile_size, BATCH_SIZ
             "model_dtype": model_dtype,
             "slide_path": slide_path,
         },
-        num_gpus=1.0/NUM_WORKERS if device.type == "cuda" else 0,
-        #memory=7*1024**3,
+        num_gpus=1.0/NUM_WORKERS,
         batch_size=BATCH_SIZE,
         compute=ray.data.ActorPoolStrategy(size=NUM_WORKERS),
         runtime_env=runtime_env,
@@ -189,22 +191,17 @@ def save_slide_embeddings(save_path, slide_df):
         os.mkdir(save_path)
     slide_df.to_parquet(save_path + "/slide.parquet", index=False)
 
-def process_slide(slide_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE):
+def process_slide(slide_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE, OVERRIDE):
     slide_metadata, tile_metadata = load_metadata(slide_path, ROWS_PER_BLOCK)
     slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
-    if(not os.path.exists(save_path + '/' + slide_name)):
-        start_time = time.time()
+    if(OVERRIDE or not os.path.exists(save_path + '/' + slide_name)):
         tile_embeddings = create_tile_embeddings(slide_path, device, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, ROWS_PER_BLOCK)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Time used for tiling only: {elapsed_time} seconds.")
-
         save_tile_embeddings(save_path + '/' + slide_name, tile_embeddings)
     else:
         print("\nTile embeddings already exists. Skipping")
         tile_embeddings = load_parquet(save_path + '/' + slide_name)
 
-    if (not os.path.exists(save_path + '/' + slide_name +"/slide.parquet")):
+    if (OVERRIDE or not os.path.exists(save_path + '/' + slide_name +"/slide.parquet")):
         slide_embeddings = create_slide_embeddings_service(slide_metadata, tile_embeddings, MODEL_DTYPE, device)
         save_slide_embeddings(save_path + '/' + slide_name, slide_embeddings)    
     else: 
@@ -241,6 +238,12 @@ def main() -> None:
         help='Limits workers to this number, will not use heuristics for workers.'
     )
 
+    parser.add_argument(
+        '--overwrite', 
+        type=bool, 
+        default=False,
+        help='If True, it will override previously generated files'
+    )
     args = parser.parse_args()
 
 
@@ -249,6 +252,7 @@ def main() -> None:
     save_path = args.save_path.rstrip('/')
     BATCH_SIZE = args.batch_size
     device = torch.device("cuda")
+    OVERRIDE= args.overwrite
     MODEL_DTYPE = torch.bfloat16
     ROWS_PER_BLOCK = 4096
     NUM_WORKERS = args.workers
@@ -264,6 +268,8 @@ def main() -> None:
 
     if (NUM_WORKERS == 0):
         NUM_WORKERS = int((TOTAL_VRAM) // VRAM_PER_WORKER)
+        if NUM_WORKERS == 0:
+            NUM_WORKERS = 1
 
     print(f"Number of workers: {NUM_WORKERS:.2f}")
     print(f"total vram: {TOTAL_VRAM:.2f}")
@@ -277,10 +283,10 @@ def main() -> None:
             print(absolute_path)
             if os.path.isdir(absolute_path):
                 continue
-            process_slide(absolute_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE)
+            process_slide(absolute_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE, OVERRIDE)
         return
 
-    process_slide(slide_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE)
+    process_slide(slide_path, save_path, device, MODEL_DTYPE, NUM_WORKERS, ROWS_PER_BLOCK, BATCH_SIZE, OVERRIDE)
 
     end_time = time.time()
     
