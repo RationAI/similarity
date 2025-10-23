@@ -256,7 +256,7 @@ def main() -> None:
     # disclaimer: based on testing, can be wrong
     MODEL_SIZE_GB = 2.13
     ONE_BATCH_SIZE_GB = 0.0085 # size of 1 tile 256x256 
-    OVERHEAD = 4 # for pytorch and os stuff
+    OVERHEAD = 6 # for pytorch and os stuff
 
     VRAM_PER_WORKER = ((BATCH_SIZE * ONE_BATCH_SIZE_GB) + MODEL_SIZE_GB)
 
