@@ -225,6 +225,13 @@ def main() -> None:
         help='Batch size for one worker. Program computes itself if it can handle more workers with this batch size.'
     )
 
+    parser.add_argument(
+        '--workers', 
+        type=int, 
+        default=0,
+        help='Limits workers to this number, will not use heuristics for workers.'
+    )
+
     args = parser.parse_args()
 
 
@@ -235,6 +242,7 @@ def main() -> None:
     device = torch.device("cuda")
     MODEL_DTYPE = torch.bfloat16
     ROWS_PER_BLOCK = 4096
+    NUM_WORKERS = args.workers
 
     # disclaimer: based on testing, can be wrong
     MODEL_SIZE_GB = 2.13
@@ -245,7 +253,9 @@ def main() -> None:
 
     TOTAL_VRAM = torch.cuda.get_device_properties(device).total_memory / 1024**3
 
-    NUM_WORKERS = int((TOTAL_VRAM - OVERHEAD) // VRAM_PER_WORKER)
+    if (NUM_WORKERS == 0):
+        NUM_WORKERS = int((TOTAL_VRAM - OVERHEAD) // VRAM_PER_WORKER)
+
     print(f"Number of workers: {NUM_WORKERS:.2f}")
     print(f"total vram: {TOTAL_VRAM:.2f}")
     print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
