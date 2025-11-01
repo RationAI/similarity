@@ -16,6 +16,11 @@ from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from src.feature_extractors import gigapathTile
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
@@ -181,6 +186,22 @@ def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH
     else: 
         print("\nSlide embeddings already exists. Skipping")
 
+def get_simmilarity(slide_path):
+    embeddings: List[torch.Tensor] = [] 
+    for dir in os.listdir(slide_path):
+        if os.path.isdir(os.path.join(slide_path, dir)):
+            embeddings_path = os.path.join(slide_path, dir, "slide.parquet")
+            tensor = torch.tensor(load_parquet(embeddings_path).embedding[0], dtype=torch.float32)
+            embeddings.append(tensor)
+
+    labels = os.listdir(slide_path)
+    emb_matrix = torch.stack(embeddings, dim=0)
+    X_norm = F.normalize(emb_matrix, p=2, dim=1)
+    cosine_sim = X_norm @ X_norm.T
+    df = pd.DataFrame(cosine_sim, index=labels, columns=labels)
+    df.to_csv("similarity_matrix.csv", float_format="%.12f", index=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Creates tile and slide embeddings for WSI with help of Gigapath"
@@ -233,6 +254,11 @@ def main() -> None:
     NUM_WORKERS = args.workers
     SLIDE_COUNT = 0
 
+    ### TODO REMOVE IF YOU NEED TO GENERATE EMBEDDINGS
+    get_simmilarity(save_path)
+    return
+
+
     # disclaimer: based on testing, can be wrong
     MODEL_SIZE_GB = 4.8
     ONE_BATCH_SIZE_GB = 0.0113  # size of 1 tile 256x256
@@ -272,7 +298,6 @@ def main() -> None:
     print(f"total vram: {TOTAL_VRAM:.2f}")
     print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
     print(f"=============================================")
-
 
 if __name__ == "__main__":
     main()
