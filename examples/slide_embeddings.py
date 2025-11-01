@@ -50,7 +50,7 @@ def load_metadata(slide_path):
 
     tissue_tiles = tiles.map_batches(
         read_slide_tiles,
-    ).filter(lambda row: row["tile"].std() > 8)
+    )#.filter(lambda row: row["tile"].std() > 8)
 
     return (slides, tissue_tiles)
 
@@ -198,9 +198,30 @@ def get_simmilarity(slide_path):
     emb_matrix = torch.stack(embeddings, dim=0)
     X_norm = F.normalize(emb_matrix, p=2, dim=1)
     cosine_sim = X_norm @ X_norm.T
-    df = pd.DataFrame(cosine_sim, index=labels, columns=labels)
-    df.to_csv("similarity_matrix.csv", float_format="%.12f", index=True)
+    #scaled_sim = (cosine_sim - 0.98) / 0.02
+    scaled_sim = cosine_sim
 
+    df = pd.DataFrame(scaled_sim, index=labels, columns=labels)
+    df.to_csv(os.path.join(save_path, "similarity_matrix.csv"), float_format="%.12f", index=True)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        scaled_sim,
+        xticklabels=labels,
+        yticklabels=labels,
+        cmap="viridis",               # nebo "coolwarm", "RdYlBu", …
+        annot=True,                   # zapíše hodnoty do buněk (volitelné)
+        fmt=".2f",                    # formát čísla
+        linewidths=0.5,
+        linecolor="gray",
+        cbar_kws={"label": "Cosine similarity"},
+    )
+    plt.title("Pairwise cosine similarity of slide embeddings")
+    plt.xticks(rotation=45, ha="right")   # čitelnost popisků
+    plt.yticks(rotation=0)                # y‑osa vodorovně
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, "slide_similarity_heatmap.png"), dpi=300)
+    plt.show()
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -254,11 +275,6 @@ def main() -> None:
     NUM_WORKERS = args.workers
     SLIDE_COUNT = 0
 
-    ### TODO REMOVE IF YOU NEED TO GENERATE EMBEDDINGS
-    get_simmilarity(save_path)
-    return
-
-
     # disclaimer: based on testing, can be wrong
     MODEL_SIZE_GB = 4.8
     ONE_BATCH_SIZE_GB = 0.0113  # size of 1 tile 256x256
@@ -298,6 +314,8 @@ def main() -> None:
     print(f"total vram: {TOTAL_VRAM:.2f}")
     print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
     print(f"=============================================")
+
+    get_simmilarity(save_path)
 
 if __name__ == "__main__":
     main()
