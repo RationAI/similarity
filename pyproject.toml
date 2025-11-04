@@ -22,6 +22,8 @@ dependencies = [
     "torch>=2.8.0",
     "flash-attn @ https://github.com/MiroPsota/torch_packages_builder/releases/download/flash_attn-2.8.3/flash_attn-2.8.3%2Bpt2.8.0cu129-cp312-cp312-linux_x86_64.whl",
     "gigapath @ git+https://github.com/jiribuchta/prov-gigapath.git@main",
+    "seaborn",
+    "matplotlib",
 ]
 
 [tool.setuptools.packages.find]

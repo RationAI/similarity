@@ -20,7 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
