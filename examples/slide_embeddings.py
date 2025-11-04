@@ -194,7 +194,11 @@ def get_simmilarity(slide_path):
             tensor = torch.tensor(load_parquet(embeddings_path).embedding[0], dtype=torch.float32)
             embeddings.append(tensor)
 
-    labels = os.listdir(slide_path)
+    labels = [
+        x 
+        for x in os.listdir(slide_path) 
+        if os.path.isdir(os.path.join(slide_path, x))
+        ]
     emb_matrix = torch.stack(embeddings, dim=0)
     X_norm = F.normalize(emb_matrix, p=2, dim=1)
     cosine_sim = X_norm @ X_norm.T
@@ -202,7 +206,7 @@ def get_simmilarity(slide_path):
     scaled_sim = cosine_sim
 
     df = pd.DataFrame(scaled_sim, index=labels, columns=labels)
-    df.to_csv(os.path.join(save_path, "similarity_matrix.csv"), float_format="%.12f", index=True)
+    df.to_csv(os.path.join(slide_path, "similarity_matrix.csv"), float_format="%.12f", index=True)
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -220,7 +224,7 @@ def get_simmilarity(slide_path):
     plt.xticks(rotation=45, ha="right")   # čitelnost popisků
     plt.yticks(rotation=0)                # y‑osa vodorovně
     plt.tight_layout()
-    plt.savefig(os.path.join(save_path, "slide_similarity_heatmap.png"), dpi=300)
+    plt.savefig(os.path.join(slide_path, "slide_similarity_heatmap.png"), dpi=300)
     plt.show()
 
 def main() -> None:
