@@ -296,8 +296,6 @@ def main() -> None:
     print(f"total vram: {TOTAL_VRAM:.2f}")
     print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
 
-    ray.init(object_store_memory=40_000_000_000)
-
     start_time = time.time()
     if os.path.isdir(slide_path):
         for slide_name in os.listdir(slide_path):
