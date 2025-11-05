@@ -42,7 +42,7 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def load_metadata(slide_path):   
-    slides = read_slides(slide_path, mpp=0.25, tile_extent=256, stride=256)
+    slides = read_slides(slide_path, mpp=0.5, tile_extent=256, stride=256)
     slides = slides.map(row_hash)
 
     tiles = slides.flat_map(tiling).repartition(target_num_rows_per_block=4096)
