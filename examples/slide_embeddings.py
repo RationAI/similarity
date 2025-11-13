@@ -80,7 +80,7 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, DEVIC
         print("ERROR: gigapath service not answering.")
         raise
 
-    return slide_metadata_df    
+    return slide_metadata_df
 
 class TileEncoderActor:
     def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype):
@@ -186,30 +186,31 @@ def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH
         print("\nSlide embeddings already exists. Skipping")
 
 def get_simmilarity(slide_path):
-    embeddings: List[torch.Tensor] = [] 
-    for dir in os.listdir(slide_path):
-        if os.path.isdir(os.path.join(slide_path, dir)):
-            embeddings_path = os.path.join(slide_path, dir, "slide.parquet")
-            tensor = torch.tensor(load_parquet(embeddings_path).embedding[0], dtype=torch.float32)
-            embeddings.append(tensor)
 
-    labels = [
-        x 
-        for x in os.listdir(slide_path) 
-        if os.path.isdir(os.path.join(slide_path, x))
-        ]
+    dirs_to_process = sorted([
+        d for d in os.listdir(slide_path) 
+        if os.path.isdir(os.path.join(slide_path, d)) and not d.startswith(".")
+    ])
+    embeddings: List[torch.Tensor] = []
+    labels = []
+
+    for dir in dirs_to_process:
+        embeddings_path = os.path.join(slide_path, dir, "slide.parquet")
+        tensor = torch.tensor(load_parquet(embeddings_path).embedding[0], dtype=torch.float32)
+        embeddings.append(tensor)
+        labels.append(dir)
+    
     emb_matrix = torch.stack(embeddings, dim=0)
     X_norm = F.normalize(emb_matrix, p=2, dim=1)
     cosine_sim = X_norm @ X_norm.T
-    #scaled_sim = (cosine_sim - 0.98) / 0.02
-    scaled_sim = cosine_sim
 
-    df = pd.DataFrame(scaled_sim, index=labels, columns=labels)
+
+    df = pd.DataFrame(cosine_sim, index=labels, columns=labels)
     df.to_csv(os.path.join(slide_path, "similarity_matrix.csv"), float_format="%.12f", index=True)
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(
-        scaled_sim,
+        cosine_sim,
         xticklabels=labels,
         yticklabels=labels,
         cmap="viridis",               # nebo "coolwarm", "RdYlBu", …
@@ -218,10 +219,11 @@ def get_simmilarity(slide_path):
         linewidths=0.5,
         linecolor="gray",
         cbar_kws={"label": "Cosine similarity"},
+        annot_kws={"fontsize": 2}
     )
     plt.title("Pairwise cosine similarity of slide embeddings")
-    plt.xticks(rotation=45, ha="right")   # čitelnost popisků
-    plt.yticks(rotation=0)                # y‑osa vodorovně
+    plt.xticks(rotation=45, ha="right", fontsize=2)   # čitelnost popisků
+    plt.yticks(rotation=0, fontsize=2)                # y‑osa vodorovně
     plt.tight_layout()
     plt.savefig(os.path.join(slide_path, "slide_similarity_heatmap.png"), dpi=300)
     plt.show()
@@ -269,6 +271,8 @@ def main() -> None:
 
 
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
+    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners" --save-path "/mnt/projects/ri_scale/privagams"
+    # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
     slide_path = args.slide_path
     save_path = args.save_path.rstrip('/')
     BATCH_SIZE = args.batch_size
