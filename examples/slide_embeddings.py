@@ -49,7 +49,7 @@ def load_metadata(slide_path):
 
     tissue_tiles = tiles.map_batches(
         read_slide_tiles,
-    ).filter(lambda row: row["tile"].std() > 8)
+    )#.filter(lambda row: row["tile"].std() > 8)
 
     return (slides, tissue_tiles)
 
