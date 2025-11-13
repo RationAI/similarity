@@ -184,64 +184,6 @@ def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH
     else: 
         print("\nSlide embeddings already exists. Skipping")
 
-def load_embeddings(slide_path):
-    dirs_to_process = sorted([
-        d for d in os.listdir(slide_path) 
-        if os.path.isdir(os.path.join(slide_path, d)) and not d.startswith(".")
-    ])
-    embeddings: List[torch.Tensor] = []
-    labels = []
-
-    for dir in dirs_to_process:
-        embeddings_path = os.path.join(slide_path, dir, "slide.parquet")
-        tensor = torch.tensor(load_parquet(embeddings_path).embedding[0], dtype=torch.float32)
-        embeddings.append(tensor)
-        labels.append(dir)
-    
-    emb_matrix = torch.stack(embeddings, dim=0)
-
-    return (emb_matrix, labels)
-
-def save_simmilarity(slide_path, sim_matrix, labels, name):
-
-    df = pd.DataFrame(sim_matrix, index=labels, columns=labels)
-    df.to_csv(os.path.join(slide_path, f"{name}_similarity.csv"), float_format="%.12f", index=True)
-
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(
-        cosine_sim,
-        xticklabels=labels,
-        yticklabels=labels,
-        cmap="viridis",
-        annot=True,
-        fmt=".2f",                    
-        linewidths=0.5,
-        linecolor="gray",
-        cbar_kws={"label": f"{name} similarity"},
-        annot_kws={"fontsize": 2}
-    )
-    plt.title(f"Pairwise {name} similarity of slide embeddings")
-    plt.xticks(rotation=45, ha="right", fontsize=2)
-    plt.yticks(rotation=0, fontsize=2)
-    plt.tight_layout()
-    plt.savefig(os.path.join(slide_path, f"{name}_similarity_heatmap.png"), dpi=300)
-
-def cos_simmilarity(slide_path):
-    emb_matrix, labels = load_embeddings(slide_path)
-    X_norm = F.normalize(emb_matrix, p=2, dim=1)
-    cosine_sim = X_norm @ X_norm.T
-    save_simmilarity(slide_path, cosine_sim, labels, "cos")
-
-def l1_simmilarity(slide_path):
-    emb_matrix, labels = load_embeddings(slide_path)
-    l1_distance_matrix = torch.cdist(emb_matrix1, emb_matrix2, p=1).numpy()
-    save_simmilarity(slide_path, cosine_sim, labels, "L1")
-
-def l2_simmilarity(slide_path):
-    emb_matrix, labels = load_embeddings(slide_path)
-    l1_distance_matrix = torch.cdist(emb_matrix1, emb_matrix2, p=2).numpy()
-    save_simmilarity(slide_path, cosine_sim, labels, "L2")
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -336,11 +278,6 @@ def main() -> None:
     print(f"total vram: {TOTAL_VRAM:.2f}")
     print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
     print(f"=============================================")
-
-    cos_simmilarity(save_path)
-    l1_simmilarity(save_path)
-    l2_simmilarity(save_path)
-
 
 if __name__ == "__main__":
     main()
