@@ -106,7 +106,7 @@ class TileEncoderActor:
         transformed_tiles = []
         
         for tile_data in batch['tile']:
-            pil_image = Image.fromarray(tile_data)
+            pil_image = Image.fromarray(tile_data).convert("RGB")
             tensor = self.transform(pil_image)
             transformed_tiles.append(tensor)
             
@@ -115,7 +115,6 @@ class TileEncoderActor:
 
         with torch.no_grad():
             embeddings_tensor = self.tile_encoder(final_input_tensor)
-            vram_used = torch.cuda.max_memory_allocated(device=self.device)
 
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
         embeddings_list = list(embeddings_array)
