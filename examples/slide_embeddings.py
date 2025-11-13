@@ -261,7 +261,7 @@ def main() -> None:
     if os.path.isdir(slide_path):
         for slide_name in os.listdir(slide_path):
             absolute_path = os.path.join(slide_path, slide_name)
-            if os.path.isdir(absolute_path):
+            if os.path.isdir(absolute_path) or absolute_path.endswith(".xml"):
                 continue
             SLIDE_COUNT += 1
             process_slide(absolute_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE)
