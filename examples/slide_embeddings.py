@@ -49,7 +49,7 @@ def load_metadata(slide_path):
 
     tissue_tiles = tiles.map_batches(
         read_slide_tiles,
-    )#.filter(lambda row: row["tile"].std() > 8)
+    ).filter(lambda row: row["tile"].std() > 8)
 
     return (slides, tissue_tiles)
 
@@ -202,7 +202,7 @@ def load_embeddings(slide_path):
 
     return (emb_matrix, labels)
 
-def save_simmilarity(sim_matrix, labels, name):
+def save_simmilarity(slide_path, sim_matrix, labels, name):
 
     df = pd.DataFrame(sim_matrix, index=labels, columns=labels)
     df.to_csv(os.path.join(slide_path, f"{name}_similarity.csv"), float_format="%.12f", index=True)
@@ -230,17 +230,17 @@ def cos_simmilarity(slide_path):
     emb_matrix, labels = load_embeddings(slide_path)
     X_norm = F.normalize(emb_matrix, p=2, dim=1)
     cosine_sim = X_norm @ X_norm.T
-    save_simmilarity(cosine_sim, labels, "cos")
+    save_simmilarity(slide_path, cosine_sim, labels, "cos")
 
 def l1_simmilarity(slide_path):
     emb_matrix, labels = load_embeddings(slide_path)
     l1_distance_matrix = torch.cdist(emb_matrix1, emb_matrix2, p=1).numpy()
-    save_simmilarity(cosine_sim, labels, "L1")
+    save_simmilarity(slide_path, cosine_sim, labels, "L1")
 
 def l2_simmilarity(slide_path):
     emb_matrix, labels = load_embeddings(slide_path)
     l1_distance_matrix = torch.cdist(emb_matrix1, emb_matrix2, p=2).numpy()
-    save_simmilarity(cosine_sim, labels, "L2")
+    save_simmilarity(slide_path, cosine_sim, labels, "L2")
 
 
 def main() -> None:
