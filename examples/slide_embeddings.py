@@ -16,7 +16,7 @@ from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from src.feature_extractors import gigapathTile
-from rationai_staining import AugmentStainingTransform, ColorConversion
+from rationai.staining import AugmentStainingTransform, ColorConversion
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
