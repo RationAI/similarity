@@ -125,7 +125,7 @@ class TileEncoderActor:
         
         for tile_data in batch['tile']:
             pil_image = Image.fromarray(tile_data).convert("RGB")
-            pil_image_stained = self.pipeline(image=pil_image)["image"]
+            pil_image_stained = self.pipeline(image=np.array(pil_image))["image"]
             tensor = self.transform(pil_image_stained)
             transformed_tiles.append(tensor)
             
