@@ -124,9 +124,9 @@ class TileEncoderActor:
         transformed_tiles = []
         
         for tile_data in batch['tile']:
-            pil_image = Image.fromarray(tile_data).convert("RGB")
-            pil_image_stained = self.pipeline(image=np.array(pil_image))["image"]
-            tensor = self.transform(pil_image_stained)
+            pil_image_stained = self.pipeline(image=tile_data)["image"]
+            pil_image = Image.fromarray(pil_image_stained).convert("RGB") # convert RGB??
+            tensor = self.transform(pil_image)
             transformed_tiles.append(tensor)
             
         batch_tensor = torch.stack(transformed_tiles)
