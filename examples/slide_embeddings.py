@@ -16,6 +16,7 @@ from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from src.feature_extractors import gigapathTile
+from rationai.staining import AugmentStainingTransform, ColorConversion
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -93,6 +94,11 @@ class TileEncoderActor:
         tile_encoder.eval()
         self.tile_encoder = tile_encoder
 
+        self.pipeline = AugmentStainingTransform(
+                            conversion=ColorConversion.RGB2HER,
+                        )
+
+
         self.transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(224),
@@ -107,7 +113,8 @@ class TileEncoderActor:
         
         for tile_data in batch['tile']:
             pil_image = Image.fromarray(tile_data).convert("RGB")
-            tensor = self.transform(pil_image)
+            pil_image_stained = self.pipeline(image=pil_image)["image"]
+            tensor = self.transform(pil_image_stained)
             transformed_tiles.append(tensor)
             
         batch_tensor = torch.stack(transformed_tiles)
