@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
+import albumentations as A
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
@@ -96,8 +97,19 @@ class TileEncoderActor:
 
         self.pipeline = AugmentStainingTransform(
                             conversion=ColorConversion.RGB2HER,
+                            noise_transform=A.Compose(
+                                [
+                                    A.MultiplicativeNoise(
+                                        multiplier=[0.5, 1.5], per_channel=True, elementwise=False, p=1.0
+                                    ),
+                                    A.AdditiveNoise(
+                                        noise_type="uniform",
+                                        noise_params={"ranges": [(-0.005, 0.005)]},
+                                        p=1.0,
+                                    ),
+                                ]
+                            ),
                         )
-
 
         self.transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
