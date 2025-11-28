@@ -16,7 +16,7 @@ from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from src.feature_extractors import gigapathTile
-from rationai.staining import ColorConversion, normalize_staining
+from rationai.staining import ColorConversion, normalize_staining, estimate_stain_vectors
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -158,7 +158,7 @@ def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZ
         }
     }
 
-    img = openslide.OpenSlide(slide_path).get_thumbnail()
+    img = openslide.OpenSlide(slide_path).get_thumbnail((1000, 1000))
     estimated_stain_vectors = estimate_stain_vectors(img)
     img.close()
 

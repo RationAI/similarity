@@ -6,8 +6,6 @@ job:
   memory: "128Gi"
   gpu: "H100"
   public: False
-  storage:
-    mou: True
 
 slide:
   slide_path: "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs"

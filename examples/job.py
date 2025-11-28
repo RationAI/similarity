@@ -20,7 +20,7 @@ def main(cfg):
         "source .venv/bin/activate",
         f"python -m examples.slide_embeddings --slide-path {cfg.slide.slide_path} --save-path {cfg.slide.save_path} --overwrite {cfg.slide.overwrite} --batch-size {cfg.workers.batch_size} --workers {cfg.workers.workers}",
         ],
-        storage=storage(mou=cfg.job.storage.mou),
+        storage=[storage.secure.DATA, storage.secure.PROJECTS],
     )
 
 if __name__ == "__main__":
