@@ -10,8 +10,8 @@ job:
     mou: True
 
 slide:
-  slide_path: "/mnt/data/MOU/breast/comparison_of_scanners"
-  save_path: "/mnt/projects/ri_scale/privagams"
+  slide_path: "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs"
+  save_path: "/mnt/projects/ri_scale/privagams/tests"
   overwrite: False
 
 workers:

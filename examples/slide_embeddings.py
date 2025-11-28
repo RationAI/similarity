@@ -16,7 +16,7 @@ from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from src.feature_extractors import gigapathTile
-from rationai.staining import AugmentStainingTransform, ColorConversion
+from rationai.staining import ColorConversion, normalize_staining
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -85,31 +85,16 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, DEVIC
     return slide_metadata_df
 
 class TileEncoderActor:
-    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype):
+    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, STAIN_VECTORS: np.array):
         self.device = DEVICE
         self.model_dtype = MODEL_DTYPE
+        self.stain_vectors = STAIN_VECTORS
 
         tile_encoder = gigapathTile()
         tile_encoder = tile_encoder.to(self.device)
         tile_encoder = tile_encoder.to(self.model_dtype)
         tile_encoder.eval()
         self.tile_encoder = tile_encoder
-
-        self.pipeline = AugmentStainingTransform(
-                            conversion=ColorConversion.RGB2HER,
-                            noise_transform=A.Compose(
-                                [
-                                    A.MultiplicativeNoise(
-                                        multiplier=[0.5, 1.5], per_channel=True, elementwise=False, p=1.0
-                                    ),
-                                    A.AdditiveNoise(
-                                        noise_type="uniform",
-                                        noise_params={"ranges": [(-0.005, 0.005)]},
-                                        p=1.0,
-                                    ),
-                                ]
-                            ),
-                        )
 
         self.transform = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -124,8 +109,17 @@ class TileEncoderActor:
         transformed_tiles = []
         
         for tile_data in batch['tile']:
-            pil_image_stained = self.pipeline(image=tile_data)["image"]
-            pil_image = Image.fromarray(pil_image_stained).convert("RGB") # convert RGB??
+            img = Image.fromarray(tile_data).convert("RGB")
+
+            # Only example values, real values should be computed from a reference region.
+            target1 = self.stain_vector[0]
+            target2 = elf.stain_vector[1]
+
+            normalized = normalize_staining(
+                img, ColorConversion.RGB2HER.matrix, target1, target2
+            )
+
+            pil_image = Image.fromarray(normalized).convert("RGB") # convert RGB??
             tensor = self.transform(pil_image)
             transformed_tiles.append(tensor)
             
@@ -164,11 +158,16 @@ def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZ
         }
     }
 
+    img = openslide.OpenSlide(slide_path).get_thumbnail()
+    estimated_stain_vectors = estimate_stain_vectors(img)
+    img.close()
+
     result_ds = tiles_metadata.map_batches(
         TileEncoderActor,
         fn_constructor_kwargs={
             "DEVICE": DEVICE,
             "MODEL_DTYPE": MODEL_DTYPE,
+            "STAIN_VECTORS": estimated_stain_vectors,
         },
         num_gpus=1.0/NUM_WORKERS,
         batch_size=BATCH_SIZE,
