@@ -26,7 +26,6 @@ dependencies = [
     "seaborn",
     "matplotlib",
     "hydra-core",
-    "rationai-kube-jobs @ git+ssh://git@gitlab.ics.muni.cz/rationai/infrastructure/kube-jobs"
 ]
 
 [tool.setuptools.packages.find]
