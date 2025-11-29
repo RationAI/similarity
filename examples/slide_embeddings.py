@@ -112,8 +112,8 @@ class TileEncoderActor:
             img = Image.fromarray(tile_data).convert("RGB")
 
             # Only example values, real values should be computed from a reference region.
-            target1 = self.stain_vector[0]
-            target2 = elf.stain_vector[1]
+            target1 = self.stain_vectors[0]
+            target2 = self.stain_vectors[1]
 
             normalized = normalize_staining(
                 img, ColorConversion.RGB2HER.matrix, target1, target2
