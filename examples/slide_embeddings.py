@@ -67,7 +67,7 @@ def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, DEVIC
     y_coords = tiles_df['y_coord'].to_numpy()
     coords_numpy = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
 
-    host = "http://rayservice-models-serve-svc.rationai-jobs-ns.svc.cluster.local:8000"
+    host = "http://rayservice-models-gigapath-serve-svc.rationai-jobs-ns.svc.cluster.local:8000"
     L = coords_numpy.shape[0]
 
     payload = embeddings_numpy.tobytes() + coords_numpy.tobytes() 
