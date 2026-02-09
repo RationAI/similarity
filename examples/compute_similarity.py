@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import numpy as np
 import re
+import argparse
 from scipy.stats import spearmanr
 from PIL import Image
 import torch.nn as nn
@@ -19,42 +20,24 @@ def load_parquet(path):
     data = pd.read_parquet(path)
     return data
 
-def load_tiles_embeddings(slide_path):
+def load_embeddings(slide_path, file_name):
+    print(slide_path)
     dirs_to_process = sorted([
         d for d in os.listdir(slide_path) 
         if os.path.isdir(os.path.join(slide_path, d)) and not d.startswith(".")
     ])
-    embeddings: List[List[torch.Tensor]] = []
+    embeddings: List[torch.Tensor] = []
     labels = []
 
     for dir in dirs_to_process:
-        embeddings_path = os.path.join(slide_path, dir, "tiles.parquet")
-        embedding_array = np.array(load_parquet(embeddings_path).embedding.tolist())
-        embedding_matrix = torch.tensor(embedding_array, dtype=torch.float32)
-        embeddings.append(embedding_matrix)
+        embeddings_path = os.path.join(slide_path, dir, file_name)
+        tensor = torch.tensor(load_parquet(embeddings_path).embedding[0], dtype=torch.float32)
+        embeddings.append(tensor)
         labels.append(dir)
     
+    emb_matrix = torch.stack(embeddings, dim=0)
 
-    return (embeddings, labels)
-
-def l1_simmilarity(slide_path, file_name):
-    emb_matrix, labels = load_embeddings(slide_path, file_name)
-    l1_distance_matrix = torch.cdist(emb_matrix, emb_matrix, p=1)
-
-    D_min = l1_distance_matrix.min()
-    D_max = l1_distance_matrix.max()
-
-    # 2. Normalizace matice na rozsah [0, 1]
-    # (Odečteme minimum a vydělíme rozsahem)
-    D_range = D_max - D_min
-    # Ošetření případu, kdy D_range je nula (např. matice plná stejných hodnot)
-    if D_range == 0:
-        similarity_matrix = torch.ones_like(l1_distance_matrix)
-    else:
-        D_norm = (l1_distance_matrix - D_min) / D_range
-        
-        # 3. Inverze (Odečtení od 1)
-        similarity_matrix = 1 - D_norm
+    return (emb_matrix, labels)
 
 def save_simmilarity(sim_matrix, labels, name):
 
@@ -154,4 +137,37 @@ def calculate_sims(embedding_matrix, labels):
     # 2. Get the "Nice Looking" Matrix
     sim_matrix = get_scaled_similarity_matrix(clean_emb)
 
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        sim_matrix,
+        xticklabels=labels,
+        yticklabels=labels,
+        cmap="viridis",
+        annot=True,
+        fmt=".2f",                    
+        linewidths=0.5,
+        linecolor="gray",
+        annot_kws={"fontsize": 10}
+    )
+    plt.xticks(rotation=45, ha="right", fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+    plt.tight_layout()
+    plt.savefig(path + "/similarity_heatmap.png", dpi=300, bbox_inches='tight')
 
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Creates slide embedding from parquet files with usage of VLAD encoder"
+    )
+    
+    parser.add_argument(
+        '--slide-path', 
+        type=str, 
+        required=True,
+        help='Absolute path to folder, with multiple subfolders with parquet files'
+    )
+    args = parser.parse_args()
+    path = args.slide_path
+
+    embedding_matrix, labels = load_embeddings(path, "slide_vlad.parquet")
+    calculate_sims(embedding_matrix, labels, path)
