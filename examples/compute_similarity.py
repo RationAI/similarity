@@ -1,5 +1,6 @@
 import torch
 import ray
+import ray.data
 import os
 import pandas as pd
 import numpy as np
@@ -126,7 +127,7 @@ def get_scaled_similarity_matrix(embeddings):
     return scaled_sim
 
 
-def calculate_sims(embedding_matrix, labels):
+def calculate_sims(embedding_matrix, labels, path):
     # ==========================================
     # EXECUTION
     # ==========================================
@@ -171,3 +172,6 @@ def main():
 
     embedding_matrix, labels = load_embeddings(path, "slide_vlad.parquet")
     calculate_sims(embedding_matrix, labels, path)
+
+if __name__ == "__main__":
+    main()

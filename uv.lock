@@ -1008,7 +1008,7 @@ wheels = [
 [[package]]
 name = "rationai-staining"
 version = "0.2.0"
-source = { git = "ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git?rev=feature%2Ftransforms#496b9297d2bf750e7130c5ddba05d1bd204e4ca7" }
+source = { git = "ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git#e91337979598542601b0507e867d9a40bf5d7cab" }
 dependencies = [
     { name = "albumentations" },
     { name = "numpy" },
@@ -1296,7 +1296,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.1" },
     { name = "pyarrow", specifier = ">=21.0.0" },
     { name = "pyvips", specifier = ">=3.0.0" },
-    { name = "rationai-staining", git = "ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git?rev=feature%2Ftransforms" },
+    { name = "rationai-staining", git = "ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git" },
     { name = "ratiopath" },
     { name = "ray", extras = ["data"], specifier = ">=2.48.0" },
     { name = "seaborn" },

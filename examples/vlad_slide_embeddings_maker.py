@@ -1,6 +1,12 @@
 import torch
 import ray
+import ray.data
 import os
+
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import pandas as pd
 import numpy as np
 import re
@@ -14,28 +20,32 @@ import seaborn as sns
 from sklearn.cluster import MiniBatchKMeans
 from scipy.spatial import KDTree
 import sklearn.preprocessing as preprocessing
+import pyarrow.parquet as pq
 
 def load_parquet(path): 
     data = pd.read_parquet(path)
     return data
+
 
 def load_tiles_embeddings(slide_path):
     dirs_to_process = sorted([
         d for d in os.listdir(slide_path) 
         if os.path.isdir(os.path.join(slide_path, d)) and not d.startswith(".")
     ])
-    embeddings: List[List[torch.Tensor]] = []
+    embeddings: List[List[torch.Tensor]] = {}
+    coords = {}
     labels = []
 
     for dir in dirs_to_process:
         embeddings_path = os.path.join(slide_path, dir, "tiles.parquet")
-        embedding_array = np.array(load_parquet(embeddings_path).embedding.tolist())
+        data = load_parquet(embeddings_path)
+        embedding_array = np.array(data.embedding.tolist())
         embedding_matrix = torch.tensor(embedding_array, dtype=torch.float32)
-        embeddings.append(embedding_matrix)
+        embeddings[dir] = embedding_matrix
+        coords[dir] = [*zip(data.x_coord.tolist(), data.y_coord.tolist())]
         labels.append(dir)
-    
 
-    return (embeddings, labels)
+    return (embeddings, labels, coords)
 
 class WSI_VLAD_Encoder:
     def __init__(self, n_clusters=16, embedding_dim=1536):
@@ -147,37 +157,40 @@ def main():
         help='Absolute path to folder, with multiple subfolders with parquet files'
     )
     args = parser.parse_args()
-    path = args.slide_path
+    slide_path = args.slide_path
 
-    for slide_path in os.listdir(path):
-        emb, labels, coords = load_tiles_embeddings(slide_path)
+    print(slide_path)
+    emb, labels, coords = load_tiles_embeddings(slide_path)
+    print(labels)
 
-        vlad = WSI_VLAD_Encoder()
+    vlad = WSI_VLAD_Encoder()
 
-        to_fit = []
+    to_fit = []
 
-        for l in labels:
-            indices = torch.randperm(emb[l].size(0))[:350]
-            random_sample = emb[l][indices]
-            to_fit.append(random_sample)
+    for l in labels:
+        indices = torch.randperm(emb[l].size(0))[:350]
+        random_sample = emb[l][indices]
+        to_fit.append(random_sample)
 
-        combined_samples = torch.cat(to_fit, dim=0)
-        cs_numpy = combined_samples.numpy()
+    combined_samples = torch.cat(to_fit, dim=0)
+    cs_numpy = combined_samples.numpy()
 
-        vlad.fit(cs_numpy)
+    vlad.fit(cs_numpy)
 
-        slide_embeddings = {}
+    slide_embeddings = {}
 
-        for l in labels:
-            wsi_vector = vlad.transform(emb[l].numpy(), coords[l])
-            slide_embeddings[l] = wsi_vector
+    for l in labels:
+        wsi_vector = vlad.transform(emb[l].numpy(), coords[l])
+        slide_embeddings[l] = wsi_vector
 
-        for l in labels:
-            wsi_embedding = slide_embeddings[l]
-            label = l
-            output_df = pd.DataFrame({
-                'slide_id': label,
-                'embedding': [wsi_embedding.tolist()],
-            })
-            output_df.to_parquet(f"{slide_path}/{label}/slide_vlad.parquet", index=False)
+    for l in labels:
+        wsi_embedding = slide_embeddings[l]
+        label = l
+        output_df = pd.DataFrame({
+            'slide_id': label,
+            'embedding': [wsi_embedding.tolist()],
+        })
+        output_df.to_parquet(f"{slide_path}/{label}/slide_vlad.parquet", index=False)
 
+if __name__ == "__main__":
+    main()
