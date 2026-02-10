@@ -54,8 +54,8 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def load_metadata(slide_path):   
-    slides = read_slides(slide_path, mpp=0.5, tile_extent=256, stride=256)
+def load_metadata(slide_path, mpp):   
+    slides = read_slides(slide_path, mpp=mpp, tile_extent=256, stride=256)
     slides = slides.map(row_hash)
 
     tiles = slides.flat_map(tiling).repartition(target_num_rows_per_block=4096)
@@ -132,8 +132,8 @@ class TileEncoderActor:
         })
         return output_df
 
-def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZE, NUM_WORKERS, save_path):
-    slide_metadata, tiles_metadata = load_metadata(slide_path)
+def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZE, NUM_WORKERS, save_path, MPP):
+    slide_metadata, tiles_metadata = load_metadata(slide_path, MPP)
     ray.data.DataContext.get_current().execution_options.verbose_progress = False
 
     conda_lib = f"{os.environ.get('CONDA_PREFIX')}/lib/libjpeg.so.8"
@@ -178,14 +178,14 @@ def save_tile_embeddings(save_path, tiles_df):
         os.makedirs(save_path)
     tiles_df.to_parquet(save_path + "/tiles.parquet", index=False)
 
-def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE):
+def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP):
     slide_name = "Unknown"
     try:
-        slide_metadata, tile_metadata = load_metadata(slide_path)
+        slide_metadata, tile_metadata = load_metadata(slide_path, MPP)
         slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
 
         if(OVERRIDE or not os.path.exists(save_path + '/' + slide_name)):
-            tile_embeddings = create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, save_path + '/' + slide_name )
+            tile_embeddings = create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, save_path + '/' + slide_name, MPP)
         else:
             print("\nTile embeddings already exists. Skipping", flush=True)
 
@@ -239,6 +239,13 @@ def main() -> None:
         default=False,
         help='If True, it will override previously generated files'
     )
+
+    parser.add_argument(
+        '--mpp', 
+        type=float, 
+        default=0.5,
+        help='Microns per pixel for the slide'
+    )
     args = parser.parse_args()
 
     slide_path = args.slide_path
@@ -248,6 +255,7 @@ def main() -> None:
     MODEL_DTYPE = torch.bfloat16
     DEVICE = torch.device("cuda")
     NUM_WORKERS = args.workers
+    MPP = args.mpp
     SLIDE_COUNT = 0
 
     # disclaimer: based on testing for GIGAPATH TILE ENCODER, can be wrong
@@ -280,9 +288,9 @@ def main() -> None:
                         print("Working on: "+ absolute_path, flush=True)
 
                         SLIDE_COUNT += 1
-                        process_slide(absolute_path, save_path_current, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE)
+                        process_slide(absolute_path, save_path_current, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP)
     else:
-        process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE)
+        process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP)
         SLIDE_COUNT += 1
     end_time = time.time()
     
