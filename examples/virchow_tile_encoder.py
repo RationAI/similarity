@@ -120,7 +120,12 @@ class TileEncoderActor:
 
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
         embeddings_list = list(embeddings_array)
+
+        curr_vram = torch.cuda.memory_allocated(self.device) / 1024**3
+        peak_vram = torch.cuda.max_memory_allocated(self.device) / 1024**3
         
+        print(f"GPU Worker {os.getpid()}: Current VRAM: {curr_vram:.2f} GB, Peak: {peak_vram:.2f} GB", flush=True)
+
         del embeddings_tensor
         del final_input_tensor
 
