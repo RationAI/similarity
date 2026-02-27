@@ -286,7 +286,7 @@ def main() -> None:
         for root, dirs, files in os.walk(slide_path):
             if not root.split("/")[-1].startswith("."):
                 for file in files:
-                    if file.endswith(".svs"):
+                    if (file.endswith(".svs") or file.endswith(".tiff")) and not "_COPY" in file:
                         root_folder = root.split("/")[-1]
                         absolute_path = f"{root}/{file}"
                         save_path_current = f"{save_path}/{root_folder}"
