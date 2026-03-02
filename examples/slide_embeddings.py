@@ -12,6 +12,7 @@ import logging
 import ray.data
 import shutil
 import psutil
+import cv2
 
 from PIL import Image
 from typing import Any
@@ -26,20 +27,6 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
 import albumentations as A
-
-def print_memory_stats():
-    # Paměť aktuálního procesu
-    process = psutil.Process(os.getpid())
-    mem_rss = process.memory_info().rss / (1024 ** 3)  # v GB
-    
-    # Celková paměť na uzlu (dostupná pro tvůj job)
-    node_mem = psutil.virtual_memory()
-    
-    print("-" * 30)
-    print(f"RAM Usage (Process): {mem_rss:.2f} GB")
-    print(f"RAM Usage (Node Total): {node_mem.percent}% used")
-    print(f"RAM Available (Node): {node_mem.available / (1024**3):.2f} GB")
-    print("-" * 30, flush=True)
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
@@ -60,16 +47,15 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
         )
     ]
 
-
 def load_metadata(slide_path, MPP=0.5):   
-    slides = read_slides(slide_path, mpp=MPP, tile_extent=256, stride=256)
+    slides = read_slides(slide_path, mpp=MPP, tile_extent=224, stride=224)
     slides = slides.map(row_hash)
 
     tiles = slides.flat_map(tiling).repartition(target_num_rows_per_block=4096)
 
     tissue_tiles = tiles.map_batches(
         read_slide_tiles,
-    )#.filter(lambda row: row["tile"].std() > 8)
+    )
 
     return (slides, tissue_tiles)
 
@@ -77,36 +63,18 @@ def load_parquet(path):
     data = pd.read_parquet(path)
     return data
 
-def create_slide_embeddings_service(slide_metadata, tiles_df, MODEL_DTYPE, DEVICE):
-    embeddings_list_of_arrays = tiles_df['embedding'].to_list() 
-    embeddings_numpy = np.stack(embeddings_list_of_arrays).astype(np.float32)
-
-    x_coords = tiles_df['x_coord'].to_numpy()
-    y_coords = tiles_df['y_coord'].to_numpy()
-    coords_numpy = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
-
-    host = "http://rayservice-models-gigapath-serve-svc.rationai-jobs-ns.svc.cluster.local:8000"
-    L = coords_numpy.shape[0]
-
-    payload = embeddings_numpy.tobytes() + coords_numpy.tobytes() 
-    url = f"{host}/gigapath-slide-encoder/{L}" 
-
-    slide_metadata_df = slide_metadata.to_pandas()
-    r = requests.post( url, data=payload, headers={"Content-Type": "application/octet-stream"}, timeout=600, ) 
-
-    try: 
-        slide_metadata_df['embedding'] = r.json()["embeddings"]
-    except Exception: 
-        print("ERROR: gigapath service not answering.")
-        raise
-
-    return slide_metadata_df
-
 class TileEncoderActor:
-    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, STAIN_VECTORS: np.array):
+    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, NORMALIZE=True, ENHANCE=True, MAKE_IMAGE=False):
+        self.saved_samples = 0 
         self.device = DEVICE
         self.model_dtype = MODEL_DTYPE
-        self.stain_vectors = STAIN_VECTORS
+        self.STAIN_VECTORS = np.array([
+            [0.64429328, 0.71655047, 0.26684416], # Hematoxylin
+            [0.03448942, 0.6508934,  0.75845514]  # Eosin
+        ])
+        self.NORMALIZE = NORMALIZE
+        self.ENHANCE = ENHANCE
+        self.MAKE_IMAGE = MAKE_IMAGE
 
         tile_encoder = gigapathTile()
         tile_encoder = tile_encoder.to(self.device)
@@ -115,8 +83,6 @@ class TileEncoderActor:
         self.tile_encoder = tile_encoder
 
         self.transform = transforms.Compose([
-        transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ])
@@ -125,22 +91,45 @@ class TileEncoderActor:
         x_coords = batch['tile_x']
         y_coords = batch['tile_y']
         transformed_tiles = []
+        keep_indices = []
         
-        for tile_data in batch['tile']:
-            img = Image.fromarray(tile_data).convert("RGB")
+        for i, tile_data in enumerate(batch['tile']):
+            if self.is_tissue(tile_data):
 
-            # Only example values, real values should be computed from a reference region.
-            target1 = self.stain_vectors[0]
-            target2 = self.stain_vectors[1]
+                img = Image.fromarray(tile_data).convert("RGB")
 
-            normalized = normalize_staining(
-                img, ColorConversion.RGB2HER.matrix, target1, target2
-            )
+                if self.NORMALIZE:
+                    img = normalize_staining(
+                        img, ColorConversion.RGB2HER.matrix, self.STAIN_VECTORS[0], self.STAIN_VECTORS[1]
+                    )
+                    normalized = img
 
-            pil_image = Image.fromarray(normalized).convert("RGB") # convert RGB??
-            tensor = self.transform(pil_image)
-            transformed_tiles.append(tensor)
-            
+                if self.ENHANCE:
+                    img = self.apply_clahe(img)
+                    enhanced = img
+
+                pil_image = Image.fromarray(img)
+                tensor = self.transform(pil_image)
+                transformed_tiles.append(tensor)
+                keep_indices.append(i)
+
+                if self.saved_samples < 5 and self.MAKE_IMAGE: # Uložíme jen prvních 5 dlaždic pro kontrolu
+                    plt.figure(figsize=(12, 4))
+                    plt.subplot(131); plt.imshow(tile_data); plt.title("Original (Raw)")
+                    plt.subplot(132); plt.imshow(normalized); plt.title("RationAI Norm")
+                    plt.subplot(133); plt.imshow(enhanced); plt.title("Norm + CLAHE")
+                    plt.savefig(f"debug_tile_{self.saved_samples}_{x_coords[i]}_{y_coords[i]}.png")
+                    plt.close()
+                    self.saved_samples += 1
+
+        if not transformed_tiles:
+            return {
+                    "slide_id": np.array([], dtype=object),
+                    "x_coord": np.array([], dtype=np.int64),
+                    "y_coord": np.array([], dtype=np.int64),
+                    "embedding": np.array([], dtype=object),
+                }
+
         batch_tensor = torch.stack(transformed_tiles)
         final_input_tensor = batch_tensor.to(self.device).to(self.model_dtype)
 
@@ -148,48 +137,82 @@ class TileEncoderActor:
             embeddings_tensor = self.tile_encoder(final_input_tensor)
 
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
-        embeddings_list = list(embeddings_array)
         
         del embeddings_tensor
         del final_input_tensor
         torch.cuda.empty_cache()
 
+        slide_ids = np.array(batch['slide_id'])
+        tile_x = np.array(batch['tile_x'])
+        tile_y = np.array(batch['tile_y'])
+        
         output_df = pd.DataFrame({
-            'slide_id': batch["slide_id"],
-            'x_coord': x_coords,
-            'y_coord': y_coords,
-            'embedding': embeddings_list,
+            'slide_id': slide_ids[keep_indices],
+            'x_coord': tile_x[keep_indices],
+            'y_coord': tile_y[keep_indices],
+            'embedding': list(embeddings_array),
         })
         return output_df
+
+    def is_tissue(self, tile: np.ndarray, threshold: float = 0.05) -> bool:
+        """
+        Vrací True, pokud dlaždice obsahuje dostatek 'barevných' pixelů (tkáně).
+        tile: (H, W, 3) v RGB, uint8 (0-255)
+        """
+        # Převod RGB na Sytost (Saturation) v rámci HSV
+        # S = (max(R,G,B) - min(R,G,B)) / max(R,G,B)
+        
+        tile_float = tile.astype(np.float32) / 255.0
+        c_max = np.max(tile_float, axis=-1)
+        c_min = np.min(tile_float, axis=-1)
+        delta = c_max - c_min
+        
+        # Vyhneme se dělení nulou u černé/šedé
+        saturation = np.where(c_max > 0, delta / c_max, 0)
+        
+        # Dlaždice je tkáň, pokud má víc než 5 % pixelů sytost > 0.15
+        # (tyto hodnoty jsou v patologii standardem pro H&E)
+        tissue_mask = saturation > 0.15
+        return np.mean(tissue_mask) > threshold
+
+    def apply_clahe(self, img_np):
+        # CLAHE se standardně provádí v LAB prostoru na 'L' kanálu (jas), 
+        # aby se nerozbily barvy
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # clipLimit: jak moc "agresivní" kontrast bude (2.0 je standard)
+        # tileGridSize: na jak velké čtverce se dlaždice rozdělí
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_updated = clahe.apply(l)
+        
+        lab_updated = cv2.merge((l_updated, a, b))
+        return cv2.cvtColor(lab_updated, cv2.COLOR_LAB2RGB)
+
 
 def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZE, NUM_WORKERS, save_path, MPP):
     slide_metadata, tiles_metadata = load_metadata(slide_path, MPP)
     ray.data.DataContext.get_current().execution_options.verbose_progress = False
 
-    conda_lib = f"{os.environ.get('CONDA_PREFIX')}/lib/libjpeg.so.8"
-    brew_lib = "/home/linuxbrew/.linuxbrew/lib/libjpeg.so.8"
-    
-    # Use whichever one actually exists
-    PRELOAD_LIB_PATH = conda_lib if os.path.exists(conda_lib) else brew_lib
-
-    runtime_env = {
-        "env_vars": {
-            "LD_LIBRARY_PATH": f"{os.path.dirname(PRELOAD_LIB_PATH)}:{os.environ.get('LD_LIBRARY_PATH', '')}",
-            "LD_PRELOAD": PRELOAD_LIB_PATH
-        },
-        "excludes": ["*"] # Keep your excludes from before!
-    }
-
-    img = openslide.OpenSlide(slide_path).get_thumbnail((1000, 1000))
-    estimated_stain_vectors = estimate_stain_vectors(img)
-    img.close()
+    #conda_lib = f"{os.environ.get('CONDA_PREFIX')}/lib/libjpeg.so.8"
+    #brew_lib = "/home/linuxbrew/.linuxbrew/lib/libjpeg.so.8"
+    #
+    ## Use whichever one actually exists
+    #PRELOAD_LIB_PATH = conda_lib if os.path.exists(conda_lib) else brew_lib
+#
+    #runtime_env = {
+    #    "env_vars": {
+    #        "LD_LIBRARY_PATH": f"{os.path.dirname(PRELOAD_LIB_PATH)}:{os.environ.get('LD_LIBRARY_PATH', '')}",
+    #        "LD_PRELOAD": PRELOAD_LIB_PATH
+    #    },
+    #    "excludes": ["*"] # Keep your excludes from before!
+    #}
 
     result_ds = tiles_metadata.map_batches(
         TileEncoderActor,
         fn_constructor_kwargs={
             "DEVICE": DEVICE,
-            "MODEL_DTYPE": MODEL_DTYPE,
-            "STAIN_VECTORS": estimated_stain_vectors,
+            "MODEL_DTYPE": MODEL_DTYPE
         },
         num_gpus=1.0/NUM_WORKERS,
         batch_size=BATCH_SIZE,
@@ -208,11 +231,6 @@ def save_tile_embeddings(save_path, tiles_df):
         os.makedirs(save_path)
     tiles_df.to_parquet(save_path + "/tiles.parquet", index=False)
 
-def save_slide_embeddings(save_path, slide_df):
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    slide_df.to_parquet(save_path + "/slide.parquet", index=False)
-
 def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP):
     slide_name = "Unknown"
     try:
@@ -223,17 +241,8 @@ def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH
             tile_embeddings = create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, save_path + '/' + slide_name, MPP )
         else:
             print("\nTile embeddings already exists. Skipping", flush=True)
-            #tile_embeddings = load_parquet(save_path + '/' + slide_name)
-
-        if (OVERRIDE or not os.path.exists(save_path + '/' + slide_name +"/slide.parquet")):
-            pass
-            #slide_embeddings = create_slide_embeddings_service(slide_metadata, tile_embeddings, MODEL_DTYPE, DEVICE)
-            #save_slide_embeddings(save_path + '/' + slide_name, slide_embeddings)    
-        else: 
-            print("\nSlide embeddings already exists. Skipping")
 
     except Exception as e:
-        # Tady je to klíčové: zapíšeme chybu, ale neukončíme skript
         print(f"\n" + "!"*50)
         print(f"CHYBA: Slide {slide_name} nebylo možné zpracovat.")
         print(f"Cesta: {slide_path}")
@@ -292,10 +301,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print_memory_stats()
-
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
-    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners" --save-path "/mnt/projects/ri_scale/privagams"
+    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" -mpp 2.0
     # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
     slide_path = args.slide_path
     save_path = args.save_path.rstrip('/')
@@ -330,12 +337,11 @@ def main() -> None:
         for root, dirs, files in os.walk(slide_path):
             if not root.split("/")[-1].startswith("."):
                 for file in files:
-                    if (file.endswith(".svs") or file.endswith(".tiff")) and not "_COPY" in file:
+                    if (file.endswith(".svs") or file.endswith(".tiff")) or file.endswith(".mrxs") and not "_COPY" in file:
                         root_folder = root.split("/")[-1]
                         absolute_path = f"{root}/{file}"
                         save_path_current = f"{save_path}/{root_folder}"
                         print("Working on: "+ absolute_path, flush=True)
-                        print_memory_stats()
 
                         SLIDE_COUNT += 1
                         process_slide(absolute_path, save_path_current, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP)
@@ -355,17 +361,17 @@ def main() -> None:
 
 if __name__ == "__main__":
 # Path to the library that fixed your 'jpeg12' error
-    PRELOAD_LIB = "/home/jb88526/.conda/envs/similarity-env/lib/libjpeg.so.8"
-    
-    runtime_env = {
-        "working_dir": ".",
-        "excludes": ["*"],
-        "env_vars": {
-            "LD_PRELOAD": PRELOAD_LIB,
-            "LD_LIBRARY_PATH": f"/home/jb88526/.conda/envs/similarity-env/lib:{os.environ.get('LD_LIBRARY_PATH', '')}"
-        }
-    }
-
+    #PRELOAD_LIB = "/home/jb88526/.conda/envs/similarity-env/lib/libjpeg.so.8"
+    #
+    #runtime_env = {
+    #    "working_dir": ".",
+    #    "excludes": ["*"],
+    #    "env_vars": {
+    #        "LD_PRELOAD": PRELOAD_LIB,
+    #        "LD_LIBRARY_PATH": f"/home/jb88526/.conda/envs/similarity-env/lib:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    #    }
+    #}
+    runtime_env = {}
     logging.getLogger("ray").setLevel(logging.ERROR)
     logging.getLogger("ray.data").setLevel(logging.ERROR)
     logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
