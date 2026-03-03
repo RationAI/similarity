@@ -11,3 +11,5 @@ wheels/
 
 # hydra
 outputs/
+
+.ipynb_checkpoints
