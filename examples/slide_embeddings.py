@@ -20,7 +20,7 @@ from torchvision import transforms
 from ratiopath.ray import read_slides
 from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
-from src.feature_extractors import gigapathTile
+from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k
 from rationai.staining import ColorConversion, normalize_staining, estimate_stain_vectors
 import torch.nn as nn
 import torch.nn.functional as F
@@ -76,16 +76,10 @@ class TileEncoderActor:
         self.ENHANCE = ENHANCE
         self.MAKE_IMAGE = MAKE_IMAGE
 
-        tile_encoder = gigapathTile()
-        tile_encoder = tile_encoder.to(self.device)
-        tile_encoder = tile_encoder.to(self.model_dtype)
-        tile_encoder.eval()
-        self.tile_encoder = tile_encoder
+        tile_encoder, transform = UNI2h()
+        self.tile_encoder = tile_encoder.to(self.device).to(self.model_dtype).eval()
 
-        self.transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ])
+        self.transform = transform
 
     def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
         x_coords = batch['tile_x']
@@ -302,7 +296,7 @@ def main() -> None:
     args = parser.parse_args()
 
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
-    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" -mpp 2.0
+    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" --mpp 2.0
     # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
     slide_path = args.slide_path
     save_path = args.save_path.rstrip('/')
