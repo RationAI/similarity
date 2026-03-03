@@ -13,6 +13,7 @@ import ray.data
 import shutil
 import psutil
 import cv2
+from pathlib import Path
 
 from PIL import Image
 from typing import Any
@@ -27,6 +28,51 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
 import albumentations as A
+from dataclasses import dataclass, asdict
+
+@dataclass
+class Config:
+
+    slide_path: str
+    save_path: str
+
+    # --- MODEL SETTINGS ---
+    encoder: int
+    device: str
+    model_dtype: torch.dtype
+    
+    # --- TILING & WSI ---
+    tile_size: int
+    mpp: float
+    batch_size: int
+    num_workers: int
+    
+    # --- PREPROCESSING TOGGLES ---
+    rmBackground: bool
+    normalize: bool
+    clahe: bool
+    overwrite: bool
+    
+    # --- CONSTANTS ---
+    # Vectors for coloring (Hematoxylin, Eosin)
+    stain_vectors: tuple
+
+    def display(self):
+        print("\n" + "="*30)
+        print("SLIDE PROCESSING CONFIG")
+        print("="*30)
+        
+        config_dict = asdict(self)
+        
+        for key, value in config_dict.items():
+            if isinstance(value, torch.dtype):
+                value = str(value)
+            elif isinstance(value, np.ndarray):
+                value = f"Array {value.shape}"
+            
+            print(f"{key:<15}: {value}")
+        
+        print("="*30 + "\n")
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
@@ -211,7 +257,7 @@ def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZ
         num_gpus=1.0/NUM_WORKERS,
         batch_size=BATCH_SIZE,
         compute=ray.data.ActorPoolStrategy(size=NUM_WORKERS),
-        runtime_env=runtime_env,
+        runtime_env={},
     )
     
     result_ds.repartition(1).write_parquet(save_path)
@@ -225,13 +271,20 @@ def save_tile_embeddings(save_path, tiles_df):
         os.makedirs(save_path)
     tiles_df.to_parquet(save_path + "/tiles.parquet", index=False)
 
-def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP):
+def process_slide(slide_path, save_path, config):
+    DEVICE = config.device
+    MODEL_DTYPE = config.model_dtype
+    NUM_WORKERS = config.num_workers
+    BATCH_SIZE = config.batch_size
+    OVERWRITE = config.overwrite
+    MPP = config.mpp
+
     slide_name = "Unknown"
     try:
         slide_metadata, tile_metadata = load_metadata(slide_path, MPP)
         slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
 
-        if(OVERRIDE or not os.path.exists(save_path + '/' + slide_name)):
+        if(OVERWRITE or not os.path.exists(save_path + '/' + slide_name)):
             tile_embeddings = create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, save_path + '/' + slide_name, MPP )
         else:
             print("\nTile embeddings already exists. Skipping", flush=True)
@@ -247,9 +300,29 @@ def process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH
             import shutil
             shutil.rmtree(current_wsi_save_path)
 
-def main() -> None:
+def get_processing_tasks(config: Config):
+    tasks = []
+    input_path = Path(config.slide_path)
+    output_base = Path(config.save_path)
+
+    extensions = {".svs", ".tiff", ".mrxs"}
+
+    if input_path.is_dir():
+        for path in input_path.rglob("*"):
+            if path.suffix.lower() in extensions and "_COPY" not in path.name:
+                rel_path = path.relative_to(input_path).parent
+                save_dir = output_base / rel_path
+                
+                tasks.append((str(path), str(save_dir)))
+    else:
+        # Pokud je vstupem jen jeden soubor
+        tasks.append((str(input_path), str(output_base)))
+
+    return tasks
+
+def parse_args() -> Config:
     parser = argparse.ArgumentParser(
-        description="Creates tile and slide embeddings for WSI with help of Gigapath"
+        description="Creates tile and slide embeddings for WSI"
     )
     
     parser.add_argument(
@@ -276,15 +349,14 @@ def main() -> None:
     parser.add_argument(
         '--workers', 
         type=int, 
-        default=0,
-        help='Limits workers to this number, will not use heuristics for workers.'
+        default=1,
+        help='Limits workers to this number.'
     )
 
     parser.add_argument(
         '--overwrite', 
-        type=bool, 
-        default=False,
-        help='If True, it will override previously generated files'
+        action='store_true',
+        help='It will override previously generated files'
     )
 
     parser.add_argument(
@@ -293,68 +365,61 @@ def main() -> None:
         default=0.5,
         help='Microns per pixel for tiling. Default is 0.5, which is common for 20x magnification.'
     )
+
+    parser.add_argument(
+        '--encoder',
+        type=int,
+        default=0,
+        help="Choose the encoder you want to use: 0: Gigapath, 1: Virchow2, 2: UNI2-h, 3: midnight-12k"
+    )
+    
+    parser.add_argument(
+        '--rmbg',
+        action='store_true',
+        help='Removes the background of the processed images before computing embeddings.'
+    )
+
+    parser.add_argument(
+        '--normalize',
+        action='store_true',
+        help='Normalize the colors of the processed images before computing embeddings.'
+    )
+
+    parser.add_argument(
+        '--clahe',
+        action='store_true',
+        help='Use CLAHE on the processed images before computing embeddings.'
+    )
+
     args = parser.parse_args()
 
-    #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
-    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" --mpp 2.0
-    # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
-    slide_path = args.slide_path
-    save_path = args.save_path.rstrip('/')
-    BATCH_SIZE = args.batch_size
-    OVERRIDE= args.overwrite
-    MODEL_DTYPE = torch.bfloat16
-    DEVICE = torch.device("cuda")
-    NUM_WORKERS = args.workers
-    SLIDE_COUNT = 0
-    MPP = args.mpp
+    config = Config(
+        slide_path = args.slide_path.rstrip("/"),
+        save_path = args.save_path.rstrip("/"),
+        encoder= args.encoder,
+        device= torch.device("cuda"),
+        model_dtype=torch.bfloat16,
+        tile_size = 224,
+        mpp = args.mpp,
+        batch_size = args.batch_size,
+        num_workers = args.workers,
+        overwrite=args.overwrite,
+        normalize=args.normalize,
+        rmBackground=args.rmbg,
+        clahe= args.clahe,
+        stain_vectors= (
+        (0.64429328, 0.71655047, 0.26684416), # Hematoxylin
+        (0.03448942, 0.6508934,  0.75845514)  # Eosin
+        )
+    )
+    config.display()
+    return config
 
-    # disclaimer: based on testing, can be wrong
-    MODEL_SIZE_GB = 4.8
-    ONE_BATCH_SIZE_GB = 0.0113  # size of 1 tile 256x256
-    OVERHEAD = 1 # for pytorch and os stuff
 
-    VRAM_PER_WORKER = ((BATCH_SIZE * ONE_BATCH_SIZE_GB) + MODEL_SIZE_GB)
+def main() -> None:
+    config = parse_args()
 
-    TOTAL_VRAM = torch.cuda.get_device_properties(DEVICE).total_memory / 1024**3
-
-    if (NUM_WORKERS == 0):
-        NUM_WORKERS = int((TOTAL_VRAM) // VRAM_PER_WORKER)
-        if NUM_WORKERS == 0:
-            NUM_WORKERS = 1
-
-    print(f"Number of workers: {NUM_WORKERS:.2f}")
-    print(f"total vram: {TOTAL_VRAM:.2f}")
-    print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
-
-    start_time = time.time()
-    if os.path.isdir(slide_path):
-        for root, dirs, files in os.walk(slide_path):
-            if not root.split("/")[-1].startswith("."):
-                for file in files:
-                    if (file.endswith(".svs") or file.endswith(".tiff")) or file.endswith(".mrxs") and not "_COPY" in file:
-                        root_folder = root.split("/")[-1]
-                        absolute_path = f"{root}/{file}"
-                        save_path_current = f"{save_path}/{root_folder}"
-                        print("Working on: "+ absolute_path, flush=True)
-
-                        SLIDE_COUNT += 1
-                        process_slide(absolute_path, save_path_current, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP)
-    else:
-        process_slide(slide_path, save_path, DEVICE, MODEL_DTYPE, NUM_WORKERS, BATCH_SIZE, OVERRIDE, MPP)
-        SLIDE_COUNT += 1
-    end_time = time.time()
-    
-    elapsed_time = end_time - start_time
-    print(f"=============================================")
-    print(f"Time elapsed: {elapsed_time:.2f} seconds")
-    print(f"Slide processed: {SLIDE_COUNT} slides")
-    print(f"Number of workers: {NUM_WORKERS}")
-    print(f"total vram: {TOTAL_VRAM:.2f}")
-    print(f"vram per worker: {VRAM_PER_WORKER:.2f}")
-    print(f"=============================================")
-
-if __name__ == "__main__":
-# Path to the library that fixed your 'jpeg12' error
+    # Path to the library that fixed your 'jpeg12' error
     #PRELOAD_LIB = "/home/jb88526/.conda/envs/similarity-env/lib/libjpeg.so.8"
     #
     #runtime_env = {
@@ -371,4 +436,25 @@ if __name__ == "__main__":
     logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
 
     ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True)
+    try:
+        start_time = time.time()
+        slides_to_process = get_processing_tasks(config)
+        print(f"Found {len(slides_to_process)} slides to process.")
+
+        for slide_path, slide_save_path in slides_to_process:
+            process_slide(slide_path, slide_save_path, config)
+
+        elapsed_time = time.time() - start_time
+        print(f"=============================================")
+        print(f"Time elapsed: {elapsed_time:.2f} seconds")
+        print(f"=============================================")
+
+    finally:
+        ray.shutdown()
+
+if __name__ == "__main__":
     main()
+
+    #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
+    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" --mpp 2.0
+    # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
