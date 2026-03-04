@@ -61,6 +61,7 @@ class Config:
         print("\n" + "="*30)
         print("SLIDE PROCESSING CONFIG")
         print("="*30)
+        print("encoders: 0: Gigapath, 1: Virchow2, 2: UNI2-h, 3: midnight-12k")
         
         config_dict = asdict(self)
         
@@ -93,8 +94,8 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
         )
     ]
 
-def load_metadata(slide_path, MPP=0.5):   
-    slides = read_slides(slide_path, mpp=MPP, tile_extent=224, stride=224)
+def load_metadata(slide_path, config):   
+    slides = read_slides(slide_path, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
     slides = slides.map(row_hash)
 
     tiles = slides.flat_map(tiling).repartition(target_num_rows_per_block=4096)
@@ -102,15 +103,11 @@ def load_metadata(slide_path, MPP=0.5):
     tissue_tiles = tiles.map_batches(
         read_slide_tiles,
     )
-
-    return (slides, tissue_tiles)
-
-def load_parquet(path): 
-    data = pd.read_parquet(path)
-    return data
+    print(tissue_tiles)
+    return tissue_tiles
 
 class TileEncoderActor:
-    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, NORMALIZE=True, ENHANCE=True, MAKE_IMAGE=False):
+    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, NORMALIZE=False, CLAHE=False, RM_BG=False, MAKE_IMAGE=False, ENCODER=0):
         self.saved_samples = 0 
         self.device = DEVICE
         self.model_dtype = MODEL_DTYPE
@@ -119,10 +116,14 @@ class TileEncoderActor:
             [0.03448942, 0.6508934,  0.75845514]  # Eosin
         ])
         self.NORMALIZE = NORMALIZE
-        self.ENHANCE = ENHANCE
+        self.CLAHE = CLAHE
         self.MAKE_IMAGE = MAKE_IMAGE
+        self.RM_BG = RM_BG
 
-        tile_encoder, transform = UNI2h()
+        encoders = [gigapathTile, virchow2, UNI2h, midnight12k]
+        selected_encoder_func = encoders[ENCODER]
+        tile_encoder, transform = selected_encoder_func()
+
         self.tile_encoder = tile_encoder.to(self.device).to(self.model_dtype).eval()
 
         self.transform = transform
@@ -134,7 +135,7 @@ class TileEncoderActor:
         keep_indices = []
         
         for i, tile_data in enumerate(batch['tile']):
-            if self.is_tissue(tile_data):
+            if self.is_tissue(tile_data) or not self.RM_BG:
 
                 img = Image.fromarray(tile_data).convert("RGB")
 
@@ -144,7 +145,7 @@ class TileEncoderActor:
                     )
                     normalized = img
 
-                if self.ENHANCE:
+                if self.CLAHE:
                     img = self.apply_clahe(img)
                     enhanced = img
 
@@ -230,8 +231,9 @@ class TileEncoderActor:
         return cv2.cvtColor(lab_updated, cv2.COLOR_LAB2RGB)
 
 
-def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZE, NUM_WORKERS, save_path, MPP):
-    slide_metadata, tiles_metadata = load_metadata(slide_path, MPP)
+def create_tile_embeddings(slide_path, save_path, config):
+    tile_metadata = load_metadata(slide_path, config)
+    
     ray.data.DataContext.get_current().execution_options.verbose_progress = False
 
     #conda_lib = f"{os.environ.get('CONDA_PREFIX')}/lib/libjpeg.so.8"
@@ -248,15 +250,19 @@ def create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, tile_size, BATCH_SIZ
     #    "excludes": ["*"] # Keep your excludes from before!
     #}
 
-    result_ds = tiles_metadata.map_batches(
+    result_ds = tile_metadata.map_batches(
         TileEncoderActor,
         fn_constructor_kwargs={
-            "DEVICE": DEVICE,
-            "MODEL_DTYPE": MODEL_DTYPE
+            "DEVICE": config.device,
+            "MODEL_DTYPE": config.model_dtype,
+            "NORMALIZE": config.normalize,
+            "RM_BG": config.rmBackground,
+            "CLAHE": config.clahe,
+            "ENCODER": config.encoder
         },
-        num_gpus=1.0/NUM_WORKERS,
-        batch_size=BATCH_SIZE,
-        compute=ray.data.ActorPoolStrategy(size=NUM_WORKERS),
+        num_gpus=1.0/config.num_workers,
+        batch_size=config.batch_size,
+        compute=ray.data.ActorPoolStrategy(size=config.num_workers),
         runtime_env={},
     )
     
@@ -272,20 +278,12 @@ def save_tile_embeddings(save_path, tiles_df):
     tiles_df.to_parquet(save_path + "/tiles.parquet", index=False)
 
 def process_slide(slide_path, save_path, config):
-    DEVICE = config.device
-    MODEL_DTYPE = config.model_dtype
-    NUM_WORKERS = config.num_workers
-    BATCH_SIZE = config.batch_size
-    OVERWRITE = config.overwrite
-    MPP = config.mpp
-
     slide_name = "Unknown"
     try:
-        slide_metadata, tile_metadata = load_metadata(slide_path, MPP)
-        slide_name = slide_metadata.take(1)[0]["path"].split('/')[-1].split('.')[0]
+        slide_name = slide_path.split('/')[-1].split('.')[0]
 
-        if(OVERWRITE or not os.path.exists(save_path + '/' + slide_name)):
-            tile_embeddings = create_tile_embeddings(slide_path, DEVICE, MODEL_DTYPE, 256, BATCH_SIZE, NUM_WORKERS, save_path + '/' + slide_name, MPP )
+        if(config.overwrite or not os.path.exists(save_path + '/' + slide_name)):
+            tile_embeddings = create_tile_embeddings(slide_path, save_path + '/' + slide_name, config )
         else:
             print("\nTile embeddings already exists. Skipping", flush=True)
 
@@ -436,6 +434,7 @@ def main() -> None:
     logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
 
     ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True)
+
     try:
         start_time = time.time()
         slides_to_process = get_processing_tasks(config)
