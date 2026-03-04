@@ -76,12 +76,14 @@ class Config:
         print("="*30 + "\n")
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
+    slide_id = Path(row["path"]).stem
+    
     return [
         {
             "tile_x": x,
             "tile_y": y,
             "path": row["path"],
-            "slide_id": row["id"],
+            "slide_id": slide_id,
             "level": row["level"],
             "tile_extent_x": row["tile_extent_x"],
             "tile_extent_y": row["tile_extent_y"],
@@ -93,18 +95,6 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
             last="keep",
         )
     ]
-
-def load_metadata(slide_path, config):   
-    slides = read_slides(slide_path, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
-    slides = slides.map(row_hash)
-
-    tiles = slides.flat_map(tiling).repartition(target_num_rows_per_block=4096)
-
-    tissue_tiles = tiles.map_batches(
-        read_slide_tiles,
-    )
-    print(tissue_tiles)
-    return tissue_tiles
 
 class TileEncoderActor:
     def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, NORMALIZE=False, CLAHE=False, RM_BG=False, MAKE_IMAGE=False, ENCODER=0):
@@ -230,74 +220,6 @@ class TileEncoderActor:
         lab_updated = cv2.merge((l_updated, a, b))
         return cv2.cvtColor(lab_updated, cv2.COLOR_LAB2RGB)
 
-
-def create_tile_embeddings(slide_path, save_path, config):
-    tile_metadata = load_metadata(slide_path, config)
-    
-    ray.data.DataContext.get_current().execution_options.verbose_progress = False
-
-    #conda_lib = f"{os.environ.get('CONDA_PREFIX')}/lib/libjpeg.so.8"
-    #brew_lib = "/home/linuxbrew/.linuxbrew/lib/libjpeg.so.8"
-    #
-    ## Use whichever one actually exists
-    #PRELOAD_LIB_PATH = conda_lib if os.path.exists(conda_lib) else brew_lib
-#
-    #runtime_env = {
-    #    "env_vars": {
-    #        "LD_LIBRARY_PATH": f"{os.path.dirname(PRELOAD_LIB_PATH)}:{os.environ.get('LD_LIBRARY_PATH', '')}",
-    #        "LD_PRELOAD": PRELOAD_LIB_PATH
-    #    },
-    #    "excludes": ["*"] # Keep your excludes from before!
-    #}
-
-    result_ds = tile_metadata.map_batches(
-        TileEncoderActor,
-        fn_constructor_kwargs={
-            "DEVICE": config.device,
-            "MODEL_DTYPE": config.model_dtype,
-            "NORMALIZE": config.normalize,
-            "RM_BG": config.rmBackground,
-            "CLAHE": config.clahe,
-            "ENCODER": config.encoder
-        },
-        num_gpus=1.0/config.num_workers,
-        batch_size=config.batch_size,
-        compute=ray.data.ActorPoolStrategy(size=config.num_workers),
-        runtime_env={},
-    )
-    
-    result_ds.repartition(1).write_parquet(save_path)
-    part_file = os.path.join(save_path, os.listdir(save_path)[0]) # vezme první soubor ve složce
-    shutil.move(part_file, save_path + "/tiles.parquet")
-    return True
-
-
-def save_tile_embeddings(save_path, tiles_df):
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    tiles_df.to_parquet(save_path + "/tiles.parquet", index=False)
-
-def process_slide(slide_path, save_path, config):
-    slide_name = "Unknown"
-    try:
-        slide_name = slide_path.split('/')[-1].split('.')[0]
-
-        if(config.overwrite or not os.path.exists(save_path + '/' + slide_name)):
-            tile_embeddings = create_tile_embeddings(slide_path, save_path + '/' + slide_name, config )
-        else:
-            print("\nTile embeddings already exists. Skipping", flush=True)
-
-    except Exception as e:
-        print(f"\n" + "!"*50)
-        print(f"CHYBA: Slide {slide_name} nebylo možné zpracovat.")
-        print(f"Cesta: {slide_path}")
-        print(f"Chyba: {str(e)}")
-        print("!"*50 + "\n", flush=True)
-        current_wsi_save_path = os.path.join(save_path, slide_name)
-        if slide_name != "Unknown" and os.path.exists(current_wsi_save_path):
-            import shutil
-            shutil.rmtree(current_wsi_save_path)
-
 def get_processing_tasks(config: Config):
     tasks = []
     input_path = Path(config.slide_path)
@@ -340,14 +262,14 @@ def parse_args() -> Config:
     parser.add_argument(
         '--batch-size', 
         type=int, 
-        default=512,
+        default=256,
         help='Batch size for one worker. Program computes itself if it can handle more workers with this batch size.'
     )
 
     parser.add_argument(
         '--workers', 
         type=int, 
-        default=1,
+        default=0,
         help='Limits workers to this number.'
     )
 
@@ -414,8 +336,46 @@ def parse_args() -> Config:
     return config
 
 
+def estimate_vram_requirement(config: Config) -> float:
+    # Midnight je lehčí, dejme mu menší základ
+    model_weights = {
+        0: 2.2, # GigaPath
+        1: 0.8, # Virchow2
+        2: 0.8, # UNI2-h
+        3: 0.5  # Midnight-12k (pokud je to ViT-B, 0.5GB stačí)
+    }.get(config.encoder, 0.8)
+    
+    # Agresivnější výpočet aktivací (méně rezervy)
+    # Pro 224x224 a batch 256 je to cca 1.5 - 2 GB
+    batch_vram = (config.batch_size / 256) * 2.0
+    
+    # CUDA a Ray režie
+    cuda_overhead = 1.0
+    
+    # Snížíme bezpečnostní rezervu z 1.3 na 1.15
+    total_needed = (model_weights + batch_vram + cuda_overhead) * 1.15
+    
+    return total_needed
+
+def auto_scale_workers(config: Config) -> int:
+    if not torch.cuda.is_available(): return 1
+    
+    total_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    needed_per_worker = estimate_vram_requirement(config)
+    
+    # Necháme si 10% rezervu, aby GPU "nedýchala naposledy"
+    usable_vram = total_vram * 0.9 
+    
+    num_workers = int(usable_vram // needed_per_worker)
+    return max(1, num_workers)
+
 def main() -> None:
     config = parse_args()
+
+    if config.num_workers <= 1: 
+            config.num_workers = auto_scale_workers(config)
+            print(f"🤖 Auto-scaling: Detected {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB VRAM.")
+            print(f"🚀 Deployment: Using {config.num_workers} parallel workers for encoder {config.encoder}.")
 
     # Path to the library that fixed your 'jpeg12' error
     #PRELOAD_LIB = "/home/jb88526/.conda/envs/similarity-env/lib/libjpeg.so.8"
@@ -437,17 +397,35 @@ def main() -> None:
 
     try:
         start_time = time.time()
-        slides_to_process = get_processing_tasks(config)
-        print(f"Found {len(slides_to_process)} slides to process.")
+        tasks = get_processing_tasks(config)
+        all_slide_paths = [t[0] for t in tasks][:10]
+        
+        print(f"Starting parallel processing of {len(all_slide_paths)} slides...")
 
-        for slide_path, slide_save_path in slides_to_process:
-            process_slide(slide_path, slide_save_path, config)
+        ds = read_slides(all_slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
 
-        elapsed_time = time.time() - start_time
-        print(f"=============================================")
-        print(f"Time elapsed: {elapsed_time:.2f} seconds")
-        print(f"=============================================")
+        ds = ds.flat_map(tiling).map_batches(read_slide_tiles)
 
+        results = ds.map_batches(
+            TileEncoderActor,
+            fn_constructor_kwargs={
+                "DEVICE": config.device,
+                "MODEL_DTYPE": config.model_dtype,
+                "NORMALIZE": config.normalize,
+                "RM_BG": config.rmBackground,
+                "CLAHE": config.clahe,
+                "ENCODER": config.encoder
+            },
+            num_cpus=0.2,
+            num_gpus=1.0 / config.num_workers,
+            compute=ray.data.ActorPoolStrategy(size=config.num_workers),
+            batch_size=config.batch_size
+        )
+
+        results.write_parquet(config.save_path, partition_cols=["slide_id"])
+
+        print(f"✅ Finished in {time.time() - start_time:.2f} seconds")
+        print(f"Time per slide: {(time.time() - start_time) / len(all_slide_paths):.2f} seconds")
     finally:
         ray.shutdown()
 
@@ -455,5 +433,5 @@ if __name__ == "__main__":
     main()
 
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
-    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" --mpp 2.0
     # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
+    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" --mpp 2.0 --encoder 3 --rmbg --normalize --clahe
