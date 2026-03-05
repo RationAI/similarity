@@ -1,33 +1,20 @@
-import openslide # needed for ratiopath
-import pyvips
 import torch
 import ray
 import os
 import argparse
 import pandas as pd
 import numpy as np
-import requests
 import time
 import logging
 import ray.data
-import shutil
-import psutil
-import cv2
 from pathlib import Path
+import multiprocessing
 
 from PIL import Image
 from typing import Any
-from torchvision import transforms
 from ratiopath.ray import read_slides
-from ratiopath.tiling.utils import row_hash
 from ratiopath.tiling import grid_tiles, read_slide_tiles
-from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k
-from rationai.staining import ColorConversion, normalize_staining, estimate_stain_vectors
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import seaborn as sns
-import albumentations as A
+from rationai.staining import ColorConversion, normalize_staining
 from dataclasses import dataclass, asdict
 
 @dataclass
@@ -97,61 +84,109 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 class TileEncoderActor:
-    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, NORMALIZE=False, CLAHE=False, RM_BG=False, MAKE_IMAGE=False, ENCODER=0):
-        self.saved_samples = 0 
+    def __init__(self, DEVICE: torch.device, MODEL_DTYPE: torch.dtype, 
+                 NORMALIZE=False, CLAHE=False, RM_BG=False, MAKE_IMAGE=False, ENCODER=0):
+        # --- LOKÁLNÍ IMPORTY (Uvnitř) ---
+        import torch
+        import cv2
+        # Tady si je ulož do self, pokud je potřebuješ v metodách
+        self.torch = torch
+        self.cv2 = cv2
+
         self.device = DEVICE
         self.model_dtype = MODEL_DTYPE
-        self.STAIN_VECTORS = np.array([
-            [0.64429328, 0.71655047, 0.26684416], # Hematoxylin
-            [0.03448942, 0.6508934,  0.75845514]  # Eosin
-        ])
         self.NORMALIZE = NORMALIZE
         self.CLAHE = CLAHE
         self.MAKE_IMAGE = MAKE_IMAGE
         self.RM_BG = RM_BG
+        
+        self.saved_samples = 0 
+        self.batch_count = 0
+        
+        # Stain vektory pro normalizaci
+        self.STAIN_VECTORS = np.array([
+            [0.64429328, 0.71655047, 0.26684416], # Hematoxylin
+            [0.03448942, 0.6508934,  0.75845514]  # Eosin
+        ])
 
+        # Inicializace CLAHE objektu jednou pro celý život aktor (obrovská úspora CPU)
+        if self.CLAHE:
+            self.clahe_obj = self.cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+        # Načtení konkrétního modelu
+        from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k
         encoders = [gigapathTile, virchow2, UNI2h, midnight12k]
         selected_encoder_func = encoders[ENCODER]
+        
         tile_encoder, transform = selected_encoder_func()
-
         self.tile_encoder = tile_encoder.to(self.device).to(self.model_dtype).eval()
-
         self.transform = transform
 
+    def is_tissue(self, tile: np.ndarray, threshold: float = 0.05) -> bool:
+        """Optimalizovaná verze detekce tkáně s downsamplingem."""
+        # Každý 2. pixel stačí pro odhad sytosti (4x rychlejší)
+        tile_sample = tile[::2, ::2].astype(np.float32) / 255.0
+        
+        c_max = np.max(tile_sample, axis=-1)
+        c_min = np.min(tile_sample, axis=-1)
+        delta = c_max - c_min
+        
+        saturation = np.where(c_max > 0, delta / c_max, 0)
+        tissue_mask = saturation > 0.15
+        return np.mean(tissue_mask) > threshold
+
+    def apply_clahe_fast(self, img_np):
+        """CLAHE přímo na numpy poli bez zbytečných konverzí."""
+        lab = self.cv2.cvtColor(img_np, self.cv2.COLOR_RGB2LAB)
+        l, a, b = self.cv2.split(lab)
+        l_updated = self.clahe_obj.apply(l)
+        lab_updated = self.cv2.merge((l_updated, a, b))
+        return self.cv2.cvtColor(lab_updated, self.cv2.COLOR_LAB2RGB)
+
     def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
-        x_coords = batch['tile_x']
-        y_coords = batch['tile_y']
+        start_batch = time.time()
+        
         transformed_tiles = []
         keep_indices = []
         
-        for i, tile_data in enumerate(batch['tile']):
-            if self.is_tissue(tile_data) or not self.RM_BG:
+        # Optimalizovaný přístup k datům v DataFrame
+        tiles = batch['tile']
+        x_coords = batch['tile_x']
+        y_coords = batch['tile_y']
+        slide_ids = batch['slide_id']
 
-                img = Image.fromarray(tile_data).convert("RGB")
+        start_pre = time.time()
+        
+        for i in range(len(tiles)):
+            tile_data = tiles[i]
+            
+            # 1. Rychlý test na tkáň hned na začátku
+            if self.RM_BG and not self.is_tissue(tile_data):
+                continue
 
-                if self.NORMALIZE:
-                    img = normalize_staining(
-                        img, ColorConversion.RGB2HER.matrix, self.STAIN_VECTORS[0], self.STAIN_VECTORS[1]
-                    )
-                    normalized = img
+            current_tile = tile_data
 
-                if self.CLAHE:
-                    img = self.apply_clahe(img)
-                    enhanced = img
+            # 2. Normalizace (pokud vrací PIL, převedeme na numpy pro CLAHE)
+            if self.NORMALIZE:
+                current_tile = normalize_staining(
+                    current_tile, ColorConversion.RGB2HER.matrix, 
+                    self.STAIN_VECTORS[0], self.STAIN_VECTORS[1]
+                )
+                if not isinstance(current_tile, np.ndarray):
+                    current_tile = np.array(current_tile)
 
-                pil_image = Image.fromarray(img)
-                tensor = self.transform(pil_image)
-                transformed_tiles.append(tensor)
-                keep_indices.append(i)
+            # 3. CLAHE (v numpy)
+            if self.CLAHE:
+                current_tile = self.apply_clahe_fast(current_tile)
 
-                if self.saved_samples < 5 and self.MAKE_IMAGE: # Uložíme jen prvních 5 dlaždic pro kontrolu
-                    plt.figure(figsize=(12, 4))
-                    plt.subplot(131); plt.imshow(tile_data); plt.title("Original (Raw)")
-                    plt.subplot(132); plt.imshow(normalized); plt.title("RationAI Norm")
-                    plt.subplot(133); plt.imshow(enhanced); plt.title("Norm + CLAHE")
-                    plt.savefig(f"debug_tile_{self.saved_samples}_{x_coords[i]}_{y_coords[i]}.png")
-                    plt.close()
-                    self.saved_samples += 1
+            # 4. Finalizace pro model (převod na PIL a Tensor)
+            pil_img = Image.fromarray(current_tile).convert("RGB")
+            tensor = self.transform(pil_img)
+            
+            transformed_tiles.append(tensor)
+            keep_indices.append(i)
+
+        end_pre = time.time()
 
         if not transformed_tiles:
             return {
@@ -161,64 +196,41 @@ class TileEncoderActor:
                     "embedding": np.array([], dtype=object),
                 }
 
-        batch_tensor = torch.stack(transformed_tiles)
-        final_input_tensor = batch_tensor.to(self.device).to(self.model_dtype)
+        # --- GPU INFERENCE ---
+        start_gpu = time.time()
+        # Vytvoříme batch na GPU asynchronně, pokud možno
+        batch_tensor = self.torch.stack(transformed_tiles).to(self.device, non_blocking=True).to(self.model_dtype)
 
-        with torch.no_grad():
-            embeddings_tensor = self.tile_encoder(final_input_tensor)
+        with self.torch.no_grad():
+            embeddings_tensor = self.tile_encoder(batch_tensor)
 
+        # Převod zpět na CPU numpy
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
-        
-        del embeddings_tensor
-        del final_input_tensor
-        torch.cuda.empty_cache()
+        end_gpu = time.time()
 
-        slide_ids = np.array(batch['slide_id'])
-        tile_x = np.array(batch['tile_x'])
-        tile_y = np.array(batch['tile_y'])
-        
+        # Statistiky pro monitoring
+        self.batch_count += 1
+        if self.batch_count % 10 == 0:
+            total_time = time.time() - start_batch
+            print(f"\n[Worker {os.getpid()}] Batch {self.batch_count}:")
+            print(f"  - Preprocessing: {(end_pre - start_pre):.3f}s")
+            print(f"  - GPU Inference: {(end_gpu - start_gpu):.3f}s")
+            print(f"  - Total:         {total_time:.3f}s")
+
+        # Sestavení výsledného DataFrame
         output_df = pd.DataFrame({
             'slide_id': slide_ids[keep_indices],
-            'x_coord': tile_x[keep_indices],
-            'y_coord': tile_y[keep_indices],
+            'x_coord': x_coords[keep_indices],
+            'y_coord': y_coords[keep_indices],
             'embedding': list(embeddings_array),
         })
+
+        # Explicitní úklid
+        del embeddings_tensor
+        del batch_tensor
+        del transformed_tiles
+        
         return output_df
-
-    def is_tissue(self, tile: np.ndarray, threshold: float = 0.05) -> bool:
-        """
-        Vrací True, pokud dlaždice obsahuje dostatek 'barevných' pixelů (tkáně).
-        tile: (H, W, 3) v RGB, uint8 (0-255)
-        """
-        # Převod RGB na Sytost (Saturation) v rámci HSV
-        # S = (max(R,G,B) - min(R,G,B)) / max(R,G,B)
-        
-        tile_float = tile.astype(np.float32) / 255.0
-        c_max = np.max(tile_float, axis=-1)
-        c_min = np.min(tile_float, axis=-1)
-        delta = c_max - c_min
-        
-        # Vyhneme se dělení nulou u černé/šedé
-        saturation = np.where(c_max > 0, delta / c_max, 0)
-        
-        # Dlaždice je tkáň, pokud má víc než 5 % pixelů sytost > 0.15
-        # (tyto hodnoty jsou v patologii standardem pro H&E)
-        tissue_mask = saturation > 0.15
-        return np.mean(tissue_mask) > threshold
-
-    def apply_clahe(self, img_np):
-        # CLAHE se standardně provádí v LAB prostoru na 'L' kanálu (jas), 
-        # aby se nerozbily barvy
-        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        
-        # clipLimit: jak moc "agresivní" kontrast bude (2.0 je standard)
-        # tileGridSize: na jak velké čtverce se dlaždice rozdělí
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        l_updated = clahe.apply(l)
-        
-        lab_updated = cv2.merge((l_updated, a, b))
-        return cv2.cvtColor(lab_updated, cv2.COLOR_LAB2RGB)
 
 def get_processing_tasks(config: Config):
     tasks = []
@@ -262,7 +274,7 @@ def parse_args() -> Config:
     parser.add_argument(
         '--batch-size', 
         type=int, 
-        default=256,
+        default=128,
         help='Batch size for one worker. Program computes itself if it can handle more workers with this batch size.'
     )
 
@@ -336,44 +348,23 @@ def parse_args() -> Config:
     return config
 
 
-def estimate_vram_requirement(config: Config) -> float:
-    # Midnight je lehčí, dejme mu menší základ
-    model_weights = {
-        0: 2.2, # GigaPath
-        1: 0.8, # Virchow2
-        2: 0.8, # UNI2-h
-        3: 0.5  # Midnight-12k (pokud je to ViT-B, 0.5GB stačí)
-    }.get(config.encoder, 0.8)
-    
-    # Agresivnější výpočet aktivací (méně rezervy)
-    # Pro 224x224 a batch 256 je to cca 1.5 - 2 GB
-    batch_vram = (config.batch_size / 256) * 2.0
-    
-    # CUDA a Ray režie
-    cuda_overhead = 1.0
-    
-    # Snížíme bezpečnostní rezervu z 1.3 na 1.15
-    total_needed = (model_weights + batch_vram + cuda_overhead) * 1.15
-    
-    return total_needed
-
-def auto_scale_workers(config: Config) -> int:
-    if not torch.cuda.is_available(): return 1
-    
+def estimate_workers(config: Config) -> float:
+    """for 256 batch size"""
     total_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    needed_per_worker = estimate_vram_requirement(config)
+    vram_per_actor = {
+        0: 4.0, # GigaPath
+        1: 2.5, # Virchow2
+        2: 5.0, # UNI2-h
+        3: 4.5  # Midnight-12k 
+    }.get(config.encoder, 1)
     
-    # Necháme si 10% rezervu, aby GPU "nedýchala naposledy"
-    usable_vram = total_vram * 0.9 
-    
-    num_workers = int(usable_vram // needed_per_worker)
-    return max(1, num_workers)
+    return int(total_vram * 0.90 // vram_per_actor)
 
 def main() -> None:
     config = parse_args()
 
     if config.num_workers <= 1: 
-            config.num_workers = auto_scale_workers(config)
+            config.num_workers = estimate_workers(config)
             print(f"🤖 Auto-scaling: Detected {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB VRAM.")
             print(f"🚀 Deployment: Using {config.num_workers} parallel workers for encoder {config.encoder}.")
 
@@ -393,18 +384,29 @@ def main() -> None:
     logging.getLogger("ray.data").setLevel(logging.ERROR)
     logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
 
-    ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True)
+    ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True, object_store_memory=40 * 1024**3) #TODO make bigger on h100?
+
+    ctx = ray.data.DataContext.get_current()
+    ctx.execution_options.max_pending_blocks = 100 # Extrémně málo, ale u MPP 0.5 nutné
+    # Vypne ukládání na disk úplně - pokud dojde RAM, Ray raději počká (backpressure)
+    ctx.execution_options.spill_threshold = 0.99
 
     try:
         start_time = time.time()
         tasks = get_processing_tasks(config)
-        all_slide_paths = [t[0] for t in tasks][:10]
+        all_slide_paths = [t[0] for t in tasks]
         
         print(f"Starting parallel processing of {len(all_slide_paths)} slides...")
 
         ds = read_slides(all_slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
 
-        ds = ds.flat_map(tiling).map_batches(read_slide_tiles)
+        total_cpus = multiprocessing.cpu_count()
+        # Rezervujeme 20 % jader pro I/O a režii, zbytek rozdělíme mezi GPU workery
+        cpus_per_worker = max(1, int((total_cpus * 0.8) / config.num_workers))
+        cpus_concurrency = max(1,int(total_cpus*0.2))
+
+        ds = ds.flat_map(tiling)
+        ds = ds.map_batches(read_slide_tiles, batch_size=config.batch_size, num_cpus=1, concurrency=cpus_concurrency)
 
         results = ds.map_batches(
             TileEncoderActor,
@@ -416,13 +418,23 @@ def main() -> None:
                 "CLAHE": config.clahe,
                 "ENCODER": config.encoder
             },
-            num_cpus=0.2,
+            num_cpus=cpus_per_worker,
             num_gpus=1.0 / config.num_workers,
             compute=ray.data.ActorPoolStrategy(size=config.num_workers),
             batch_size=config.batch_size
         )
 
-        results.write_parquet(config.save_path, partition_cols=["slide_id"])
+        results = results.repartition(num_blocks=len(all_slide_paths)*2)
+
+        # 2. Samotný zápis
+        results.write_parquet(
+            config.save_path, 
+            partition_cols=["slide_id"], 
+            # use_threads zrychlí IO operace při zápisu na disk
+            use_threads=True,
+            # snappy je standard, který je velmi rychlý na CPU
+            compression="snappy"
+        )
 
         print(f"✅ Finished in {time.time() - start_time:.2f} seconds")
         print(f"Time per slide: {(time.time() - start_time) / len(all_slide_paths):.2f} seconds")
@@ -434,4 +446,4 @@ if __name__ == "__main__":
 
     #slide_path = '/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs'
     # /home/jovyan/prov-gigapath/demo/outputs_jirka/parquets
-    #python -m examples.slide_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/FLASH2021_6802-01-T.mrxs" --save-path "/home/jovyan/output" --mpp 2.0 --encoder 3 --rmbg --normalize --clahe
+    #python -m examples.tile_embeddings --slide-path "/mnt/data/MOU/breast/comparison_of_scanners/" --save-path "/home/jovyan/output" --mpp 2.0 --encoder 1 --rmbg --normalize --clahe
