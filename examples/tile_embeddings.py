@@ -394,13 +394,13 @@ def main() -> None:
     try:
         start_time = time.time()
         tasks = get_processing_tasks(config)
-        all_slide_paths = [t[0] for t in tasks]
+        all_slide_paths = [t[0] for t in tasks][:2]
         
         print(f"Starting parallel processing of {len(all_slide_paths)} slides...")
 
         ds = read_slides(all_slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
 
-        total_cpus = multiprocessing.cpu_count()
+        total_cpus = 16
         # Rezervujeme 20 % jader pro I/O a režii, zbytek rozdělíme mezi GPU workery
         cpus_per_worker = max(1, int((total_cpus * 0.8) / config.num_workers))
         cpus_concurrency = max(1,int(total_cpus*0.2))
@@ -424,16 +424,10 @@ def main() -> None:
             batch_size=config.batch_size
         )
 
-        results = results.repartition(num_blocks=len(all_slide_paths)*2)
-
         # 2. Samotný zápis
         results.write_parquet(
             config.save_path, 
             partition_cols=["slide_id"], 
-            # use_threads zrychlí IO operace při zápisu na disk
-            use_threads=True,
-            # snappy je standard, který je velmi rychlý na CPU
-            compression="snappy"
         )
 
         print(f"✅ Finished in {time.time() - start_time:.2f} seconds")
