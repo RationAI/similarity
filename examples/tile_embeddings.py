@@ -16,6 +16,21 @@ from ratiopath.ray import read_slides
 from ratiopath.tiling import grid_tiles, read_slide_tiles
 from rationai.staining import ColorConversion, normalize_staining
 from dataclasses import dataclass, asdict
+import urllib.parse
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import pandas.errors
+
+# Vynucení existence atributu, který Ray postrádá
+if not hasattr(pd.errors, "SettingWithCopyWarning"):
+    class SettingWithCopyWarning(Warning):
+        pass
+    pd.errors.SettingWithCopyWarning = SettingWithCopyWarning
+
+import pandas.core.common as pcc
+if not hasattr(pcc, "SettingWithCopyWarning"):
+    pcc.SettingWithCopyWarning = pd.errors.SettingWithCopyWarning
 
 @dataclass
 class Config:
@@ -63,7 +78,7 @@ class Config:
         print("="*30 + "\n")
 
 def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
-    slide_id = Path(row["path"]).stem
+    slide_id = str(Path(row["path"]))
     
     return [
         {
@@ -236,20 +251,34 @@ def get_processing_tasks(config: Config):
     tasks = []
     input_path = Path(config.slide_path)
     output_base = Path(config.save_path)
-
     extensions = {".svs", ".tiff", ".mrxs"}
 
     if input_path.is_dir():
         for path in input_path.rglob("*"):
             if path.suffix.lower() in extensions and "_COPY" not in path.name:
-                rel_path = path.relative_to(input_path).parent
-                save_dir = output_base / rel_path
+                # 1. Vytvoření identifikátoru slide_id (stejně jako to dělá Ray)
+                # Ray cesty escapuje (např. / se změní na %2F), musíme to simulovat
+                slide_id_val = urllib.parse.quote(str(path), safe="")
                 
-                tasks.append((str(path), str(save_dir)))
+                # 2. Cesta, kam Ray ukládá data pro tento konkrétní slide
+                # Formát: save_path/slide_id=...
+                check_dir = output_base / f"slide_id={slide_id_val}"
+                
+                # 3. Kontrola: Existuje složka a obsahuje aspoň jeden parquet?
+                is_done = check_dir.exists() and any(check_dir.glob("*.parquet"))
+                
+                if not is_done:
+                    rel_path = path.relative_to(input_path).parent
+                    save_dir = output_base / rel_path
+                    tasks.append((str(path), str(save_dir)))
+                else:
+                    print(f"Skipping already processed slide: {path.name}")
+                    pass
     else:
-        # Pokud je vstupem jen jeden soubor
+        # Pro jeden soubor (zjednodušená kontrola)
         tasks.append((str(input_path), str(output_base)))
 
+    print(f"Total tasks to process: {len(tasks)}")
     return tasks
 
 def parse_args() -> Config:
@@ -274,7 +303,7 @@ def parse_args() -> Config:
     parser.add_argument(
         '--batch-size', 
         type=int, 
-        default=128,
+        default=512,
         help='Batch size for one worker. Program computes itself if it can handle more workers with this batch size.'
     )
 
@@ -384,7 +413,7 @@ def main() -> None:
     logging.getLogger("ray.data").setLevel(logging.ERROR)
     logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
 
-    ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True, object_store_memory=40 * 1024**3) #TODO make bigger on h100?
+    ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True, object_store_memory=60 * 1024**3) #TODO make bigger on h100?
 
     ctx = ray.data.DataContext.get_current()
     ctx.execution_options.max_pending_blocks = 100 # Extrémně málo, ale u MPP 0.5 nutné
@@ -394,13 +423,15 @@ def main() -> None:
     try:
         start_time = time.time()
         tasks = get_processing_tasks(config)
-        all_slide_paths = [t[0] for t in tasks][:2]
+        print(tasks)
+        return
+        all_slide_paths = [t[0] for t in tasks]
         
         print(f"Starting parallel processing of {len(all_slide_paths)} slides...")
 
         ds = read_slides(all_slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
 
-        total_cpus = 16
+        total_cpus = 20 # musica cpu count
         # Rezervujeme 20 % jader pro I/O a režii, zbytek rozdělíme mezi GPU workery
         cpus_per_worker = max(1, int((total_cpus * 0.8) / config.num_workers))
         cpus_concurrency = max(1,int(total_cpus*0.2))
