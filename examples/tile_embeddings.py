@@ -423,8 +423,6 @@ def main() -> None:
     try:
         start_time = time.time()
         tasks = get_processing_tasks(config)
-        print(tasks)
-        return
         all_slide_paths = [t[0] for t in tasks]
         
         print(f"Starting parallel processing of {len(all_slide_paths)} slides...")
