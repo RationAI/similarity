@@ -117,6 +117,7 @@ class TileEncoderActor:
         
         self.saved_samples = 0 
         self.batch_count = 0
+        self.tile_size = 224
         
         # Stain vektory pro normalizaci
         self.STAIN_VECTORS = np.array([
@@ -174,7 +175,14 @@ class TileEncoderActor:
         
         for i in range(len(tiles)):
             tile_data = tiles[i]
-            
+
+            if tile_data.shape[0] != self.tile_size:
+                tile_data = self.cv2.resize(
+                    tile_data, 
+                    (self.tile_size, self.tile_size), 
+                    interpolation=self.cv2.INTER_AREA
+                )
+
             # 1. Rychlý test na tkáň hned na začátku
             if self.RM_BG and not self.is_tissue(tile_data):
                 continue
@@ -249,6 +257,7 @@ class TileEncoderActor:
 
 def get_processing_tasks(config: Config):
     tasks = []
+    tiff_tasks = []
     input_path = Path(config.slide_path)
     output_base = Path(config.save_path)
     extensions = {".svs", ".tiff", ".mrxs"}
@@ -270,16 +279,21 @@ def get_processing_tasks(config: Config):
                 if not is_done:
                     rel_path = path.relative_to(input_path).parent
                     save_dir = output_base / rel_path
-                    tasks.append((str(path), str(save_dir)))
+                    if path.suffix.lower() == ".tiff":
+                        tiff_tasks.append((str(path), str(save_dir)))
+                    else:
+                        tasks.append((str(path), str(save_dir)))
                 else:
                     print(f"Skipping already processed slide: {path.name}")
                     pass
     else:
-        # Pro jeden soubor (zjednodušená kontrola)
-        tasks.append((str(input_path), str(output_base)))
+        if path.suffix.lower() == ".tiff":
+            tiff_tasks.append((str(input_path), str(output_base)))
+        else:
+            tasks.append((str(input_path), str(output_base)))
 
-    print(f"Total tasks to process: {len(tasks)}")
-    return tasks
+    print(f"Total tasks to process: {len(tasks)+len(tiff_tasks)}")
+    return tasks, tiff_tasks
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
@@ -310,7 +324,7 @@ def parse_args() -> Config:
     parser.add_argument(
         '--workers', 
         type=int, 
-        default=0,
+        default=1,
         help='Limits workers to this number.'
     )
 
@@ -376,26 +390,8 @@ def parse_args() -> Config:
     config.display()
     return config
 
-
-def estimate_workers(config: Config) -> float:
-    """for 256 batch size"""
-    total_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    vram_per_actor = {
-        0: 4.0, # GigaPath
-        1: 2.5, # Virchow2
-        2: 5.0, # UNI2-h
-        3: 4.5  # Midnight-12k 
-    }.get(config.encoder, 1)
-    
-    return int(total_vram * 0.90 // vram_per_actor)
-
 def main() -> None:
     config = parse_args()
-
-    if config.num_workers <= 1: 
-            config.num_workers = estimate_workers(config)
-            print(f"🤖 Auto-scaling: Detected {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB VRAM.")
-            print(f"🚀 Deployment: Using {config.num_workers} parallel workers for encoder {config.encoder}.")
 
     # Path to the library that fixed your 'jpeg12' error
     #PRELOAD_LIB = "/home/jb88526/.conda/envs/similarity-env/lib/libjpeg.so.8"
@@ -422,12 +418,36 @@ def main() -> None:
 
     try:
         start_time = time.time()
-        tasks = get_processing_tasks(config)
-        all_slide_paths = [t[0] for t in tasks]
-        
-        print(f"Starting parallel processing of {len(all_slide_paths)} slides...")
+        tasks, tiff_tasks = get_processing_tasks(config)
+        slide_paths = [t[0] for t in tasks]
+        tiff_paths = [t[0] for t in tiff_tasks]
 
-        ds = read_slides(all_slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
+        print(slide_paths)
+        print(tiff_paths)
+        
+        ds_slide = None
+        ds_tiff = None
+
+        if slide_paths:
+            ds_slide = read_slides(slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
+        if tiff_paths: # I hate you Jakub
+            if config.mpp == 0.5:
+                ds_tiff = read_slides(tiff_paths, level=0, tile_extent=448, stride=448)
+            elif config.mpp == 1.0:
+                ds_tiff = read_slides(tiff_paths, level=0, tile_extent=896, stride=896)
+            else:
+                ds_tiff = read_slides(tiff_paths, level=0, tile_extent=1792, stride=1792)
+
+        if ds_slide and ds_tiff:
+            ds = ds_slide.union(ds_tiff)
+        elif ds_slide:
+            ds = ds_slide
+        elif ds_tiff:
+            ds = ds_tiff
+        else:
+            print("Žádné slidy k procesování.")
+            ray.shutdown()
+            return
 
         total_cpus = 20 # musica cpu count
         # Rezervujeme 20 % jader pro I/O a režii, zbytek rozdělíme mezi GPU workery
