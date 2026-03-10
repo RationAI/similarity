@@ -1,156 +1,197 @@
 import ray
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
+import os
+import random
+import time
+import gc
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import KDTree
-import torch
 from pathlib import Path
-import time
-
-# --- 1. PROSTOROVÉ ZPRACOVÁNÍ (SUPER-TILES) ---
-
-def create_super_tiles(df, tile_size=224):
-    """
-    Zprůměruje embeddingy v mřížce 3x3 (SuperTiles).
-    """
-    coords = df[['x_coord', 'y_coord']].values
-    embs = np.stack(df['embedding'].values)
+from tqdm import tqdm
+# --- 1. SKUTEČNĚ PAMĚŤOVĚ ŠETRNÉ NAČÍTÁNÍ ---
+def safe_read_parquet(path):
+    table = pq.read_table(path)
+    coords = np.column_stack([
+        table.column('x_coord').to_numpy(),
+        table.column('y_coord').to_numpy()
+    ]).astype(np.float32)
     
-    # Radius nastaven tak, aby našel sousedy v mřížce (včetně diagonál)
-    # 1.5 * tile_size pokryje okolí 3x3
-    tree = KDTree(coords)
-    indices = tree.query_radius(coords, r=1.5 * tile_size)
+    # KLÍČOVÁ ZMĚNA: Žádné to_pylist(). 
+    # Vytáhneme raw data z Arrow bufferu přímo do NumPy pole.
+    # .values.to_numpy() u ListArray v Arrow vrátí zploštělé pole všech floatů.
+    combined = table.column('embedding').combine_chunks()
+    flattened_embs = combined.values.to_numpy()
     
-    super_embs = np.zeros_like(embs)
-    for i, idx_list in enumerate(indices):
-        super_embs[i] = np.mean(embs[idx_list], axis=0)
-        
-    return super_embs
-
-# --- 2. AGREGAČNÍ ALGORITMY ---
+    # Zjistíme dimenzi (pravděpodobně 768 nebo 1024)
+    dim = len(flattened_embs) // len(coords)
+    embs = flattened_embs.reshape(len(coords), dim).astype(np.float32)
+    
+    del table, combined, flattened_embs
+    return coords, embs
 
 def compute_soft_vlad(embeddings, centroids, sigma=1.0):
-    """
-    Soft-assignment VLAD (Vector of Locally Aggregated Descriptors).
-    """
-    # Vzdálenosti (N, K)
-    dists = np.linalg.norm(embeddings[:, np.newaxis] - centroids, axis=2)
+    """Vektorizovaný výpočet VLAD agregace."""
+    if len(embeddings) == 0: 
+        return np.zeros(centroids.shape[0] * centroids.shape[1], dtype=np.float32)
     
-    # Soft-weights
-    weights = np.exp(-sigma * dists**2)
-    weights /= (weights.sum(axis=1, keepdims=True) + 1e-12)
+    # Efektivní výpočet vzdáleností přes dot product
+    dots = np.dot(embeddings, centroids.T)
+    emb_sq = np.sum(embeddings**2, axis=1, keepdims=True)
+    cen_sq = np.sum(centroids**2, axis=1)
+    dists_sq = emb_sq + cen_sq - 2 * dots
     
-    K, D = centroids.shape
-    vlad = np.zeros((K, D))
+    # Soft-assignment váhy
+    weights = np.exp(-sigma * dists_sq)
+    weights /= (np.sum(weights, axis=1, keepdims=True) + 1e-12)
     
-    for k in range(K):
-        res = (embeddings - centroids[k]) * weights[:, k:k+1]
-        vlad[k] = np.sum(res, axis=0)
-        
-    # Normalizace
-    vlad = np.sign(vlad) * np.sqrt(np.abs(vlad)) # Power norm
-    vlad_flat = vlad.flatten()
-    return vlad_flat / (np.linalg.norm(vlad_flat) + 1e-6)
+    # Výpočet reziduí (K, D) bez loopů
+    V = np.dot(weights.T, embeddings) - (weights.sum(axis=0)[:, np.newaxis] * centroids)
+    
+    vlad_flat = V.flatten()
+    # Power normalization
+    vlad_flat = np.sign(vlad_flat) * np.sqrt(np.abs(vlad_flat))
+    
+    # L2 normalization
+    norm = np.linalg.norm(vlad_flat)
+    return (vlad_flat / (norm + 1e-6)).astype(np.float32)
 
-def compute_fisher_vector(embeddings, gmm):
-    """
-    Fisher Vector encoding pomocí GMM (Gaussian Mixture Model).
-    """
-    means = gmm.means_
-    covs = gmm.covariances_ # Diagonální
-    priors = gmm.weights_
-    N = embeddings.shape[0]
-    K, D = means.shape
-
-    # Pravděpodobnosti příslušnosti ke komponentám (N, K)
-    resps = gmm.predict_proba(embeddings)
+def compute_fisher_vector(embeddings, means, covs, priors):
+    """Vektorizovaný Fisher Vector bez 3D matic a loopů."""
+    if len(embeddings) == 0: 
+        return np.zeros(2 * means.shape[0] * means.shape[1], dtype=np.float32)
     
-    # Gradienty
-    u_k = np.zeros((K, D))
-    v_k = np.zeros((K, D))
+    N, D = embeddings.shape
+    K = means.shape[0]
+    inv_covs = 1.0 / (covs + 1e-6)
     
-    for k in range(K):
-        diff = embeddings - means[k]
-        u_k[k] = np.sum(resps[:, k:k+1] * diff, axis=0) / (N * np.sqrt(priors[k]))
-        v_k[k] = np.sum(resps[:, k:k+1] * (diff**2 / covs[k] - 1), axis=0) / (N * np.sqrt(2 * priors[k]))
-
+    # Výpočet responsibilit (N, K) přes log-likelihood trik
+    # dists = (x-m)^2 / s = x^2/s - 2xm/s + m^2/s
+    dots = np.dot(embeddings, (means * inv_covs).T)
+    emb_sq = np.dot(embeddings**2, inv_covs.T)
+    means_sq = np.sum(means**2 * inv_covs, axis=1)
+    
+    dists_sq = emb_sq - 2 * dots + means_sq
+    resps = np.exp(-0.5 * dists_sq) * priors / (np.sqrt(np.prod(covs, axis=1)) + 1e-6)
+    resps /= (resps.sum(axis=1, keepdims=True) + 1e-12)
+    
+    # Gradienty u_k a v_k (vše vektorizovaně)
+    resps_sum = resps.sum(axis=0)[:, np.newaxis]
+    
+    # u_k: První řád (středy)
+    u_k = (np.dot(resps.T, embeddings) - resps_sum * means) 
+    u_k /= (N * np.sqrt(priors)[:, np.newaxis] + 1e-6)
+    
+    # v_k: Druhý řád (rozptyly)
+    # v_k = sum(gamma * [(x-mu)^2 / sigma - 1])
+    # (x-mu)^2 = x^2 - 2x*mu + mu^2
+    term2 = np.dot(resps.T, embeddings**2) - 2 * means * np.dot(resps.T, embeddings) + resps_sum * means**2
+    v_k = (term2 * inv_covs - resps_sum) / (N * np.sqrt(2 * priors)[:, np.newaxis] + 1e-6)
+    
     fv = np.concatenate([u_k.flatten(), v_k.flatten()])
-    
-    # Normalizace
+    # Power + L2 normalization
     fv = np.sign(fv) * np.sqrt(np.abs(fv))
-    return fv / (np.linalg.norm(fv) + 1e-6)
+    return (fv / (np.linalg.norm(fv) + 1e-6)).astype(np.float32)
 
-# --- 4. MAIN PIPELINE ---
+def create_super_tiles(coords, embs, r=336):
+    """Bleskový výpočet super-tiles pomocí NumPy indexování."""
+    if len(coords) < 2: return embs
+    tree = KDTree(coords)
+    
+    # Najdeme indexy 10 nejbližších sousedů pro všechny body najednou
+    _, indices = tree.query(coords, k=10)
+    
+    # embs[indices] vytvoří matici (N, 10, D)
+    # np.mean přes osu 1 spočítá průměr těch 10 sousedů pro každou dlaždici
+    return np.mean(embs[indices], axis=1).astype(np.float32)
 
-def aggregate_all_methods(group_df, vlad_model, gmm_model):
-    """
-    Zpracuje jeden slide všemi 4 kombinacemi najednou.
-    """
-    slide_id = group_df["slide_id"].iloc[0]
-    raw_embs = np.stack(group_df['embedding'].values)
-    
-    # 1. Připravíme SuperTiles (prostorové vyhlazení)
-    st_embs = create_super_tiles(group_df)
-    
-    # Pomocné funkce pro výpočet (předpokládám, že je máš v kódu definované)
-    vlad_centroids = vlad_model.cluster_centers_
-    
-    results = {
-        "slide_id": slide_id,
-        # VLAD kombinace
-        "vlad_raw": compute_soft_vlad(raw_embs, vlad_centroids),
-        "vlad_super": compute_soft_vlad(st_embs, vlad_centroids),
-        # Fisher kombinace
-        "fisher_raw": compute_fisher_vector(raw_embs, gmm_model),
-        "fisher_super": compute_fisher_vector(st_embs, gmm_model)
-    }
-    
-    return pd.DataFrame([results])
+@ray.remote
+def process_single_slide(f_path, v_c, f_m, f_c, f_p, out_dir):
+    """Worker funkce pro paralelní běh."""
+    try:
+        slide_id = os.path.basename(f_path).replace("slide_id=", "")
+        out_path = Path(out_dir) / f"{slide_id.replace('/', '_')}.parquet"
+        
+        # Přeskočit, pokud už hotovo
+        if out_path.exists(): 
+            return slide_id
+
+        p_files = list(Path(f_path).glob("*.parquet"))
+        c_list, e_list = [], []
+        for pf in p_files:
+            c, e = safe_read_parquet(pf)
+            c_list.append(c)
+            e_list.append(e)
+        
+        coords = np.concatenate(c_list)
+        embs = np.concatenate(e_list)
+        
+        # Výpočty (tvůj super-rychlý kód)
+        st_embs = create_super_tiles(coords, embs)
+        
+        res = {
+            "slide_id": slide_id,
+            "vlad_raw": compute_soft_vlad(embs, v_c),
+            "vlad_super": compute_soft_vlad(st_embs, v_c),
+            "fisher_raw": compute_fisher_vector(embs, f_m, f_c, f_p),
+            "fisher_super": compute_fisher_vector(st_embs, f_m, f_c, f_p)
+        }
+        
+        pd.DataFrame([res]).to_parquet(out_path)
+        return slide_id
+    except Exception as e:
+        return f"Error {slide_id}: {e}"
 
 def main():
-    # TODO: change on musica
-    INPUT_DIR = "../output/"
-    SAMPLE_SIZE = 500000 
-    vlad_clusters = 256
-    fisher_clusters = 64
+    INPUT_DIR = "/data/fs201053/jb88526/privagams_enc1_mpp05_enhanced"
+    OUTPUT_DIR = "/data/fs201053/jb88526/slide"
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    
+    # Inicializace Ray - omezíme na 20 CPU (nebo kolik máš alokováno)
+    if not ray.is_initialized():
+        ray.init(num_cpus=20)
 
-    ray.init(ignore_reinit_error=True)
+    all_folders = sorted([str(f) for f in Path(INPUT_DIR).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
     
-    print(f"📂 Načítám data z {INPUT_DIR}...")
-    ds = ray.data.read_parquet(INPUT_DIR)
+    # 1. TRÉNOVÁNÍ (Sekvenční, jen na začátku)
+    print("🧠 Trénuji codebooky...")
+    sample_folders = random.sample(all_folders, min(25, len(all_folders)))
+    sample_list = [safe_read_parquet(list(Path(f).glob("*.parquet"))[0])[1][:2000] for f in sample_folders if list(Path(f).glob("*.parquet"))]
+    all_sample = np.concatenate(sample_list)
     
-    # --- KROK 1: TRÉNOVÁNÍ MODELŮ (CODEBOOKS) ---
-    print(f"🧠 Trénuji modely na vzorku dat (pro VLAD i Fisher)...")
-    sample_df = ds.random_sample(0.1).limit(SAMPLE_SIZE).to_pandas()
-    train_embs = create_super_tiles(sample_df)
+    vlad_m = MiniBatchKMeans(n_clusters=256, batch_size=4096).fit(all_sample)
+    gmm_m = GaussianMixture(n_components=64, covariance_type='diag').fit(all_sample)
     
-    # VLAD model (K-Means)
-    vlad_model = MiniBatchKMeans(n_clusters=vlad_clusters, batch_size=2048, n_init=3)
-    vlad_model.fit(train_embs)
+    # 2. PŘÍPRAVA PRO SDÍLENOU PAMĚŤ (ray.put)
+    v_c_ref = ray.put(vlad_m.cluster_centers_.astype(np.float32))
+    f_m_ref = ray.put(gmm_m.means_.astype(np.float32))
+    f_c_ref = ray.put(gmm_m.covariances_.astype(np.float32))
+    f_p_ref = ray.put(gmm_m.weights_.astype(np.float32))
     
-    # Fisher model (GMM)
-    gmm_model = GaussianMixture(n_components=fisher_clusters, covariance_type='diag', max_iter=50)
-    gmm_model.fit(train_embs)
+    del all_sample, sample_list
+    gc.collect()
+
+    # 3. PARALELNÍ SPOUŠTĚNÍ
+    print(f"🚀 Startuji paralelní zpracování {len(all_folders)} slidů...")
     
-    # --- KROK 2: DISTRIBUOVANÁ AGREGACE ---
-    print(f"🚀 Spouštím hromadnou agregaci (4 metody) pomocí map_groups...")
-    
-    # Spustíme výpočet pro všechny kombinace najednou
-    final_ds = ds.groupby("slide_id").map_groups(
-        lambda df: aggregate_all_methods(df, vlad_model, gmm_model)
-    )
-    
-    print("⌛ Probíhá výpočet na klastru... (toto může trvat déle, počítáme 4 deskriptory)")
-    final_data_df = final_ds.to_pandas()
-    
-    # --- KROK 3: ULOŽENÍ ---
-    save_name = "descriptors_comparison_all.pkl"
-    final_data_df.to_pickle(save_name)
-    
-    print(f"✅ Hotovo! Výsledky uloženy do {save_name}")
-    print(f"Zpracováno slidů: {len(final_data_df)}")
-    print(f"Dostupné sloupce: {list(final_data_df.columns)}")
+    # Vytvoříme seznam úkolů
+    result_refs = [
+        process_single_slide.remote(f_path, v_c_ref, f_m_ref, f_c_ref, f_p_ref, OUTPUT_DIR) 
+        for f_path in all_folders
+    ]
+
+    # Sledujeme progress pomocí tqdm
+    results = []
+    with tqdm(total=len(result_refs)) as pbar:
+        while len(result_refs) > 0:
+            done_refs, result_refs = ray.wait(result_refs, num_returns=1)
+            results.append(ray.get(done_refs[0]))
+            pbar.update(1)
+
+    print(f"✨ Vše hotovo. Výsledky v: {OUTPUT_DIR}")
+    ray.shutdown()
 
 if __name__ == "__main__":
     main()
