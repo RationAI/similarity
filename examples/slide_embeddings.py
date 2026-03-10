@@ -145,8 +145,8 @@ def process_single_slide(f_path, v_c, f_m, f_c, f_p, out_dir):
         return f"Error {slide_id}: {e}"
 
 def main():
-    INPUT_DIR = "/data/fs201053/jb88526/privagams_enc1_mpp05_enhanced"
-    OUTPUT_DIR = "/data/fs201053/jb88526/slide"
+    INPUT_DIR = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced"
+    OUTPUT_DIR = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced_slide"
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     
     # Inicializace Ray - omezíme na 20 CPU (nebo kolik máš alokováno)
