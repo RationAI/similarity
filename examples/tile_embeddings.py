@@ -159,9 +159,7 @@ class TileEncoderActor:
         lab_updated = self.cv2.merge((l_updated, a, b))
         return self.cv2.cvtColor(lab_updated, self.cv2.COLOR_LAB2RGB)
 
-    def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
-        start_batch = time.time()
-        
+    def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:        
         transformed_tiles = []
         keep_indices = []
         
@@ -220,7 +218,6 @@ class TileEncoderActor:
                 }
 
         # --- GPU INFERENCE ---
-        start_gpu = time.time()
         # Vytvoříme batch na GPU asynchronně, pokud možno
         batch_tensor = self.torch.stack(transformed_tiles).to(self.device, non_blocking=True).to(self.model_dtype)
 
@@ -230,15 +227,6 @@ class TileEncoderActor:
         # Převod zpět na CPU numpy
         embeddings_array = embeddings_tensor.cpu().to(torch.float32).numpy()
         end_gpu = time.time()
-
-        # Statistiky pro monitoring
-        self.batch_count += 1
-        if self.batch_count % 10 == 0:
-            total_time = time.time() - start_batch
-            print(f"\n[Worker {os.getpid()}] Batch {self.batch_count}:")
-            print(f"  - Preprocessing: {(end_pre - start_pre):.3f}s")
-            print(f"  - GPU Inference: {(end_gpu - start_gpu):.3f}s")
-            print(f"  - Total:         {total_time:.3f}s")
 
         # Sestavení výsledného DataFrame
         output_df = pd.DataFrame({
@@ -294,6 +282,151 @@ def get_processing_tasks(config: Config):
 
     print(f"Total tasks to process: {len(tasks)+len(tiff_tasks)}")
     return tasks, tiff_tasks
+
+class CPUPreprocessActor:
+    def __init__(self, ENCODER=0, NORMALIZE=False, CLAHE=False, RM_BG=False):
+        import torch
+        import cv2
+        import numpy as np
+        from PIL import Image
+        from rationai.staining import ColorConversion, normalize_staining
+        from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k
+
+        self.cv2 = cv2
+        self.np = np
+        self.Image = Image
+        self.normalize_staining = normalize_staining
+        self.ColorConversion = ColorConversion
+        
+        self.NORMALIZE = NORMALIZE
+        self.CLAHE = CLAHE
+        self.RM_BG = RM_BG
+        self.tile_size = 224
+        
+        self.STAIN_VECTORS = self.np.array([
+            [0.64429328, 0.71655047, 0.26684416],
+            [0.03448942, 0.6508934,  0.75845514]
+        ])
+
+        if self.CLAHE:
+            self.clahe_obj = self.cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+        encoders = [gigapathTile, virchow2, UNI2h, midnight12k]
+        _, self.transform = encoders[ENCODER]()
+
+    def is_tissue(self, tile: np.ndarray, threshold: float = 0.05) -> bool:
+        tile_sample = tile[::2, ::2].astype(self.np.float32) / 255.0
+        c_max = self.np.max(tile_sample, axis=-1)
+        c_min = self.np.min(tile_sample, axis=-1)
+        delta = c_max - c_min
+        saturation = self.np.where(c_max > 0, delta / c_max, 0)
+        return self.np.mean(saturation > 0.15) > threshold
+
+    def apply_clahe_fast(self, img_np):
+        lab = self.cv2.cvtColor(img_np, self.cv2.COLOR_RGB2LAB)
+        l, a, b = self.cv2.split(lab)
+        l_updated = self.clahe_obj.apply(l)
+        return self.cv2.cvtColor(self.cv2.merge((l_updated, a, b)), self.cv2.COLOR_LAB2RGB)
+
+    def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:        
+        transformed_tiles = []
+        keep_indices = []
+        
+        tiles = batch['tile']
+        x_coords = batch['tile_x']
+        y_coords = batch['tile_y']
+        slide_ids = batch['slide_id']
+        
+        for i in range(len(tiles)):
+            tile_data = tiles[i]
+            if tile_data.shape[0] != self.tile_size:
+                tile_data = self.cv2.resize(tile_data, (self.tile_size, self.tile_size), interpolation=self.cv2.INTER_AREA)
+
+            if self.RM_BG and not self.is_tissue(tile_data):
+                continue
+
+            if self.NORMALIZE:
+                tile_data = self.normalize_staining(tile_data, self.ColorConversion.RGB2HER.matrix, self.STAIN_VECTORS[0], self.STAIN_VECTORS[1])
+                if not isinstance(tile_data, self.np.ndarray): tile_data = self.np.array(tile_data)
+
+            if self.CLAHE:
+                tile_data = self.apply_clahe_fast(tile_data)
+
+            # Transformace na tenzor a hned ZPĚT na numpy (pro efektivní Ray transfer)
+            pil_img = self.Image.fromarray(tile_data).convert("RGB")
+            tensor = self.transform(pil_img)
+            transformed_tiles.append(tensor.numpy()) # Tady je ta změna!
+            keep_indices.append(i)
+
+        if not transformed_tiles:
+            return pd.DataFrame({
+                            "slide_id": pd.Series([], dtype=str),
+                            "x_coord": pd.Series([], dtype=int),
+                            "y_coord": pd.Series([], dtype=int),
+                            "tile": pd.Series([], dtype=object),
+                        })
+
+        return pd.DataFrame({
+            'slide_id': slide_ids[keep_indices],
+            'x_coord': x_coords[keep_indices],
+            'y_coord': y_coords[keep_indices],
+            'tile': transformed_tiles,
+        })
+
+class GPUPredictor:
+    def __init__(self, encoder_idx, device, dtype):
+        import torch
+        import numpy as np
+        from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.torch = torch
+        self.np = np
+        
+        encoders = [gigapathTile, virchow2, UNI2h, midnight12k]
+        model, _ = encoders[encoder_idx]()
+        self.model = model.to(self.device).to(self.dtype).eval()
+
+    def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
+        if len(batch.get('slide_id', [])) == 0:
+            return pd.DataFrame({
+                "slide_id": pd.Series([], dtype=str),
+                "x_coord": pd.Series([], dtype=int),
+                "y_coord": pd.Series([], dtype=int),
+                "embedding": pd.Series([], dtype=object),
+            })
+
+        # batch['tile'] teď obsahuje seznam numpy polí, stackujeme je do jednoho velkého tenzoru
+        # Použijeme as_tensor, což je u numpy polí bleskové
+        data_stack = self.np.stack(batch['tile'])
+        batch_tensor = self.torch.as_tensor(data_stack).to(self.device, non_blocking=True).to(self.dtype)
+
+        with self.torch.no_grad():
+            output = self.model(batch_tensor)  # Výsledek: (Batch, 261, 1280)
+            
+            # 1. Extrakce podle dokumentace
+            class_token = output[:, 0]    # Globální informace
+            patch_tokens = output[:, 5:]  # Lokální informace (přeskočíme registry 1-4)
+            
+            # 2. Agregace lokální informace (průměr přes prostorové tokeny)
+            # Z (Batch, 256, 1280) uděláme (Batch, 1280)
+            patched_avg = patch_tokens.mean(dim=1)
+            
+            # 3. Spojení do finálního embeddingu (Batch, 2560)
+            embedding_tensor = self.torch.cat([class_token, patched_avg], dim=-1)
+
+        # Uložíme jako float32 pro stabilitu a menší velikost
+        embeddings_array = embedding_tensor.cpu().to(self.torch.float16).numpy()
+
+        output_df = pd.DataFrame({
+            'slide_id': batch['slide_id'],
+            'x_coord': batch['x_coord'],
+            'y_coord': batch['y_coord'],
+            'embedding': [emb for emb in embeddings_array], # NumPy pole v buňce, ne list!
+        })
+
+        del output, embedding_tensor, batch_tensor
+        return output_df
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
@@ -409,10 +542,10 @@ def main() -> None:
     logging.getLogger("ray.data").setLevel(logging.ERROR)
     logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
 
-    ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True, object_store_memory=60 * 1024**3) #TODO make bigger on h100?
+    ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True, object_store_memory=20 * 1024**3) #TODO make bigger on h100?
 
     ctx = ray.data.DataContext.get_current()
-    ctx.execution_options.max_pending_blocks = 100 # Extrémně málo, ale u MPP 0.5 nutné
+    ctx.execution_options.max_pending_blocks = 50 # Extrémně málo, ale u MPP 0.5 nutné
     # Vypne ukládání na disk úplně - pokud dojde RAM, Ray raději počká (backpressure)
     ctx.execution_options.spill_threshold = 0.99
 
@@ -449,28 +582,37 @@ def main() -> None:
             ray.shutdown()
             return
 
-        total_cpus = 20 # musica cpu count
-        # Rezervujeme 20 % jader pro I/O a režii, zbytek rozdělíme mezi GPU workery
-        cpus_per_worker = max(1, int((total_cpus * 0.8) / config.num_workers))
-        cpus_concurrency = max(1,int(total_cpus*0.2))
+        total_cpus = 22
+        cpus_concurrency = 8 # Pro čtení z disku
 
         ds = ds.flat_map(tiling)
-        ds = ds.map_batches(read_slide_tiles, batch_size=config.batch_size, num_cpus=1, concurrency=cpus_concurrency)
+        ds = ds.map_batches(read_slide_tiles, batch_size=512, num_cpus=1, concurrency=cpus_concurrency)
 
-        results = ds.map_batches(
-            TileEncoderActor,
+        ds = ds.map_batches(
+            CPUPreprocessActor,
             fn_constructor_kwargs={
-                "DEVICE": config.device,
-                "MODEL_DTYPE": config.model_dtype,
                 "NORMALIZE": config.normalize,
-                "RM_BG": config.rmBackground,
                 "CLAHE": config.clahe,
-                "ENCODER": config.encoder
+                "RM_BG": config.rmBackground,
+                "ENCODER": config.encoder},
+            compute=ray.data.ActorPoolStrategy(size=8), # Tady zapojíme těch 30 jader
+            num_cpus=1,
+            batch_size=512
+        )
+
+        # --- 2. GPU INFERENCE (1 worker na H100) ---
+        results = ds.map_batches(
+            GPUPredictor,
+            fn_constructor_kwargs={
+                "encoder_idx": config.encoder, 
+                "device": "cuda", 
+                "dtype": config.model_dtype
             },
-            num_cpus=cpus_per_worker,
-            num_gpus=1.0 / config.num_workers,
-            compute=ray.data.ActorPoolStrategy(size=config.num_workers),
-            batch_size=config.batch_size
+            # Tady je ta změna:
+            compute=ray.data.ActorPoolStrategy(size=2), # Vytvoří 2 samostatné Aktory
+            num_gpus=0.50,  # Každý Aktor dostane jednu celou GPU
+            num_cpus=1,    # Každý Aktor dostane 2 CPU pro komunikaci s GPU
+            batch_size=512
         )
 
         # 2. Samotný zápis
@@ -480,7 +622,7 @@ def main() -> None:
         )
 
         print(f"✅ Finished in {time.time() - start_time:.2f} seconds")
-        print(f"Time per slide: {(time.time() - start_time) / len(all_slide_paths):.2f} seconds")
+        print(f"Time per slide: {(time.time() - start_time) / (len(slide_paths) + len(tiff_paths)):.2f} seconds")
     finally:
         ray.shutdown()
 
