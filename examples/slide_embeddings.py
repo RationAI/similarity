@@ -1,8 +1,14 @@
+
+import os
+# MUSÍ BÝT PŘED IMPORTEM NUMPY/SKLEARN
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import ray
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import os
 import random
 import time
 import gc
@@ -19,19 +25,37 @@ np.random.seed(42)
 # --- 1. ŠETRNÉ NAČÍTÁNÍ ---
 def safe_read_parquet(path):
     table = pq.read_table(path)
+    
+    # 1. Načtení souřadnic - ty jsou uloženy správně (50 řádků)
     coords = np.column_stack([
         table.column('x_coord').to_numpy(),
         table.column('y_coord').to_numpy()
     ]).astype(np.float32)
     
-    combined = table.column('embedding').combine_chunks()
-    flattened_embs = combined.values.to_numpy()
+    # 2. Načtení embeddingů - Ray je uložil jako Tensor Extension v rámci batche
+    # Musíme vzít 'values' z toho prvního (a často jediného) záznamu v buňce
+    raw_col = table.column('embedding')
     
-    dim = len(flattened_embs) // len(coords)
-    embs = flattened_embs.reshape(len(coords), dim).astype(np.float32)
+    # Ray Data často uloží všechny embeddingy batche do prvního řádku jako jeden velký array
+    # .to_pylist()[0] vytáhne ten obří seznam (např. 261 * 1280 prvků)
+    embs_flat = np.array(raw_col.to_pylist()[0], dtype=np.float32)
     
-    del table, combined, flattened_embs
-    return coords, embs
+    # 3. Dynamický Reshape
+    dim = 1280 # Pro Virchow2
+    # Pokud by náhodou velikost neseděla na 1280, zkusíme UNI (1024)
+    if embs_flat.size % 1280 != 0 and embs_flat.size % 1024 == 0:
+        dim = 1024
+        
+    num_tiles = embs_flat.size // dim
+    embs_all = embs_flat.reshape(num_tiles, dim)
+    
+    # 4. Sladění s počtem souřadnic
+    # Protože Ray mohl uložit víc embeddingů v jednom blesku (batchi), 
+    # ořízneme to přesně podle počtu souřadnic v tomto souboru
+    if len(embs_all) > len(coords):
+        embs_all = embs_all[:len(coords)]
+        
+    return coords, embs_all
 
 def compute_soft_vlad(embeddings, centroids, sigma=1.0):
     if len(embeddings) == 0: 
@@ -126,12 +150,13 @@ def process_single_slide(f_path, v_c, f_m, f_c, f_p, out_dir):
 
 # --- 5. HLAVNÍ FUNKCE ---
 def main():
-    INPUT_DIR = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced"
-    OUTPUT_DIR = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced_slide_v3" # Nový adresář pro v3
+    #TODO ASSURE THAT I HAVE ALL TILES IN PARQUET FILES, SOME COULD BE MISSED DUE TO TESTING IF FILE ALREADY EXISTS
+    INPUT_DIR = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced"
+    OUTPUT_DIR = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced_slide_v3" # Nový adresář pro v3
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     
     if not ray.is_initialized():
-        ray.init(num_cpus=20)
+        ray.init(num_cpus=6, object_store_memory=20 * 1024**3,)
 
     all_folders = sorted([str(f) for f in Path(INPUT_DIR).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
     
@@ -148,10 +173,19 @@ def main():
     
     all_sample = np.concatenate(sample_list)
     
-    # 64 klastrů je pro tuhle úlohu "sweet spot"
-    vlad_m = MiniBatchKMeans(n_clusters=64, batch_size=4096, random_state=42, n_init=3).fit(all_sample)
-    gmm_m = GaussianMixture(n_components=32, covariance_type='diag', random_state=42).fit(all_sample)
+    print(f"Tvar vzorku: {all_sample.shape}", flush=True)
+    print(f"Typ dat: {all_sample.dtype}")
+    print(f"Obsahuje NaN: {np.isnan(all_sample).any()}")
 
+    print(f"Trénuji k-means na {len(all_sample)} vzorcích...")
+    vlad_m = MiniBatchKMeans(n_clusters=64, batch_size=4096, random_state=42, n_init=1).fit(all_sample)
+    print("✅ K-means hotovo.")
+
+    print("Trénuji GMM...")
+    gmm_m = GaussianMixture(n_components=32, covariance_type='diag', random_state=42, max_iter=20, init_params='random').fit(all_sample)
+    print("✅ GMM hotovo.")
+
+    print("✅ Codebooky připraveny. Připravuji data pro paralelní zpracování...")
     # Sdílení v Ray paměti
     v_c_ref = ray.put(vlad_m.cluster_centers_.astype(np.float32))
     f_m_ref = ray.put(gmm_m.means_.astype(np.float32))

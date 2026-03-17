@@ -319,7 +319,7 @@ class CPUPreprocessActor:
         c_max = self.np.max(tile_sample, axis=-1)
         c_min = self.np.min(tile_sample, axis=-1)
         delta = c_max - c_min
-        saturation = self.np.where(c_max > 0, delta / c_max, 0)
+        saturation = self.np.divide(delta, c_max, out=self.np.zeros_like(delta), where=c_max > 0)
         return self.np.mean(saturation > 0.15) > threshold
 
     def apply_clahe_fast(self, img_np):
@@ -386,6 +386,7 @@ class GPUPredictor:
         encoders = [gigapathTile, virchow2, UNI2h, midnight12k]
         model, _ = encoders[encoder_idx]()
         self.model = model.to(self.device).to(self.dtype).eval()
+        self.encoder_idx = encoder_idx
 
     def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
         if len(batch.get('slide_id', [])) == 0:
@@ -401,22 +402,32 @@ class GPUPredictor:
         data_stack = self.np.stack(batch['tile'])
         batch_tensor = self.torch.as_tensor(data_stack).to(self.device, non_blocking=True).to(self.dtype)
 
-        with self.torch.no_grad():
-            output = self.model(batch_tensor)  # Výsledek: (Batch, 261, 1280)
-            
-            # 1. Extrakce podle dokumentace
-            class_token = output[:, 0]    # Globální informace
-            patch_tokens = output[:, 5:]  # Lokální informace (přeskočíme registry 1-4)
-            
-            # 2. Agregace lokální informace (průměr přes prostorové tokeny)
-            # Z (Batch, 256, 1280) uděláme (Batch, 1280)
-            patched_avg = patch_tokens.mean(dim=1)
-            
-            # 3. Spojení do finálního embeddingu (Batch, 2560)
-            embedding_tensor = self.torch.cat([class_token, patched_avg], dim=-1)
+        if self.encoder_idx == 1: # virchow2
+            with self.torch.no_grad():
+                output = self.model(batch_tensor)  # Výsledek: (Batch, 261, 1280)
+                
+                # 1. Extrakce podle dokumentace
+                class_token = output[:, 0]    # Globální informace
+                patch_tokens = output[:, 5:]  # Lokální informace (přeskočíme registry 1-4)
+                
+                # 2. Agregace lokální informace (průměr přes prostorové tokeny)
+                # Z (Batch, 256, 1280) uděláme (Batch, 1280)
+                patched_avg = patch_tokens.mean(dim=1)
+                
+                # 3. Spojení do finálního embeddingu (Batch, 2560)
+                embedding_tensor = self.torch.cat([class_token, patched_avg], dim=-1)
 
-        # Uložíme jako float32 pro stabilitu a menší velikost
-        embeddings_array = embedding_tensor.cpu().to(self.torch.float16).numpy()
+            # Uložíme jako float32 pro stabilitu a menší velikost
+            embeddings_array = embedding_tensor.cpu().to(self.torch.float16).numpy()
+            del output, embedding_tensor, batch_tensor
+        
+        else:
+            with self.torch.no_grad():
+                embeddings_tensor = self.model(batch_tensor)
+
+            # Převod zpět na CPU numpy
+            embeddings_array = embeddings_tensor.cpu().to(torch.float16).numpy()
+            del embeddings_tensor, batch_tensor
 
         output_df = pd.DataFrame({
             'slide_id': batch['slide_id'],
@@ -424,8 +435,6 @@ class GPUPredictor:
             'y_coord': batch['y_coord'],
             'embedding': [emb for emb in embeddings_array], # NumPy pole v buňce, ne list!
         })
-
-        del output, embedding_tensor, batch_tensor
         return output_df
 
 def parse_args() -> Config:
@@ -583,10 +592,10 @@ def main() -> None:
             return
 
         total_cpus = 22
-        cpus_concurrency = 8 # Pro čtení z disku
+        cpus_concurrency = 10 # Pro čtení z disku
 
         ds = ds.flat_map(tiling)
-        ds = ds.map_batches(read_slide_tiles, batch_size=512, num_cpus=1, concurrency=cpus_concurrency)
+        ds = ds.map_batches(read_slide_tiles, batch_size=128, num_cpus=1, concurrency=cpus_concurrency)
 
         ds = ds.map_batches(
             CPUPreprocessActor,
@@ -595,9 +604,9 @@ def main() -> None:
                 "CLAHE": config.clahe,
                 "RM_BG": config.rmBackground,
                 "ENCODER": config.encoder},
-            compute=ray.data.ActorPoolStrategy(size=8), # Tady zapojíme těch 30 jader
+            compute=ray.data.ActorPoolStrategy(size=10), # Tady zapojíme těch 30 jader
             num_cpus=1,
-            batch_size=512
+            batch_size=128
         )
 
         # --- 2. GPU INFERENCE (1 worker na H100) ---
@@ -609,10 +618,10 @@ def main() -> None:
                 "dtype": config.model_dtype
             },
             # Tady je ta změna:
-            compute=ray.data.ActorPoolStrategy(size=2), # Vytvoří 2 samostatné Aktory
-            num_gpus=0.50,  # Každý Aktor dostane jednu celou GPU
+            compute=ray.data.ActorPoolStrategy(size=1), # Vytvoří 2 samostatné Aktory
+            num_gpus=1,  # Každý Aktor dostane jednu celou GPU
             num_cpus=1,    # Každý Aktor dostane 2 CPU pro komunikaci s GPU
-            batch_size=512
+            batch_size=64
         )
 
         # 2. Samotný zápis
