@@ -1,9 +1,9 @@
 
 import os
 # MUSÍ BÝT PŘED IMPORTEM NUMPY/SKLEARN
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+#os.environ["OMP_NUM_THREADS"] = "1"
+#os.environ["MKL_NUM_THREADS"] = "1"
+#os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import ray
 import numpy as np
@@ -25,35 +25,23 @@ np.random.seed(42)
 # --- 1. ŠETRNÉ NAČÍTÁNÍ ---
 def safe_read_parquet(path):
     table = pq.read_table(path)
-    
-    # 1. Načtení souřadnic - ty jsou uloženy správně (50 řádků)
     coords = np.column_stack([
         table.column('x_coord').to_numpy(),
         table.column('y_coord').to_numpy()
     ]).astype(np.float32)
     
-    # 2. Načtení embeddingů - Ray je uložil jako Tensor Extension v rámci batche
-    # Musíme vzít 'values' z toho prvního (a často jediného) záznamu v buňce
-    raw_col = table.column('embedding')
+    raw_col = table.column('embedding').to_pylist()
+    embs_all = np.array(raw_col, dtype=np.float32)
     
-    # Ray Data často uloží všechny embeddingy batche do prvního řádku jako jeden velký array
-    # .to_pylist()[0] vytáhne ten obří seznam (např. 261 * 1280 prvků)
-    embs_flat = np.array(raw_col.to_pylist()[0], dtype=np.float32)
-    
-    # 3. Dynamický Reshape
-    dim = 1280 # Pro Virchow2
-    # Pokud by náhodou velikost neseděla na 1280, zkusíme UNI (1024)
-    if embs_flat.size % 1280 != 0 and embs_flat.size % 1024 == 0:
-        dim = 1024
-        
-    num_tiles = embs_flat.size // dim
-    embs_all = embs_flat.reshape(num_tiles, dim)
-    
-    # 4. Sladění s počtem souřadnic
-    # Protože Ray mohl uložit víc embeddingů v jednom blesku (batchi), 
-    # ořízneme to přesně podle počtu souřadnic v tomto souboru
+    if embs_all.ndim == 3:
+        embs_all = embs_all.reshape(-1, embs_all.shape[-1])
+
+    # Vrátíme surový embedding a souřadnice
+    # (Ořezání na CLS/Patches uděláme až při výpočtu)
     if len(embs_all) > len(coords):
         embs_all = embs_all[:len(coords)]
+    elif len(embs_all) < len(coords):
+        coords = coords[:len(embs_all)]
         
     return coords, embs_all
 
@@ -79,6 +67,42 @@ def compute_soft_vlad(embeddings, centroids, sigma=1.0):
     
     norm = np.linalg.norm(vlad_flat)
     return (vlad_flat / (norm + 1e-6)).astype(np.float32)
+
+import numpy as np
+
+def compute_fisher_variants(embeddings, means, covs, priors, suffix=""):
+    N, D = embeddings.shape
+    # Soft assignment
+    # Místo původního resps výpočtu:
+    dists = -0.5 * np.sum((embeddings[:, np.newaxis, :] - means)**2 / (covs + 1e-3), axis=2)
+    # Stabilní výpočet pravděpodobností
+    max_dists = np.max(dists, axis=1, keepdims=True)
+    resps = np.exp(dists - max_dists) 
+    resps /= (resps.sum(axis=1, keepdims=True) + 1e-12)
+    resps_sum = resps.sum(axis=0)
+
+    # u_k (středy)
+    u_k = (np.dot(resps.T, embeddings) - resps_sum[:, np.newaxis] * means)
+    u_k /= (N * np.sqrt(priors)[:, np.newaxis] + 1e-8)
+
+    # v_k (rozptyl - s regulací 1e-3)
+    v_k = np.zeros_like(u_k)
+    for k in range(len(priors)):
+        diff = embeddings - means[k]
+        v_k[k] = np.dot(resps[:, k], (diff**2 / (covs[k] + 1e-3)) - 1.0)
+    v_k /= (N * np.sqrt(2 * priors)[:, np.newaxis] + 1e-8)
+
+    def finalize(v):
+        v = np.sign(v) * np.sqrt(np.abs(v))
+        norm = np.linalg.norm(v)
+        return v / (norm + 1e-8) if norm > 1e-8 else v
+
+    s = f"_{suffix}" if suffix else ""
+    return {
+        f"fisher_mean{s}": finalize(u_k.flatten()),
+        f"fisher_var{s}": finalize(v_k.flatten()),
+        f"fisher_robust{s}": finalize(np.concatenate([u_k.flatten(), v_k.flatten()]))
+    }
 
 # --- 3. RYCHLÝ FISHER VECTOR ---
 def compute_fisher_vector(embeddings, means, covs, priors):
@@ -114,7 +138,7 @@ def create_super_tiles(coords, embs, k=10):
     return np.mean(embs[indices], axis=1).astype(np.float32)
 
 @ray.remote
-def process_single_slide(f_path, v_c, f_m, f_c, f_p, out_dir):
+def process_single_slide(f_path, gmm_refs_dict, vlad_refs_dict, out_dir):
     try:
         slide_id = os.path.basename(f_path).replace("slide_id=", "")
         out_path = Path(out_dir) / f"{slide_id.replace('/', '_')}.parquet"
@@ -122,82 +146,128 @@ def process_single_slide(f_path, v_c, f_m, f_c, f_p, out_dir):
         if out_path.exists(): 
             return slide_id
 
-        p_files = list(Path(f_path).glob("*.parquet"))
+        # Změna na iterdir, aby to našlo soubory i bez přípony .parquet (časté u Ray Datasetů)
+        p_files = [f for f in Path(f_path).iterdir() if f.is_file() and not f.name.startswith(".")]
+        if not p_files:
+            return f"Skipped {slide_id}: No files found"
+
         c_list, e_list = [], []
         for pf in p_files:
-            c, e = safe_read_parquet(pf)
+            c, e = safe_read_parquet(pf) 
             c_list.append(c)
             e_list.append(e)
         
         coords = np.concatenate(c_list)
-        embs = np.concatenate(e_list)
+        embs_full = np.concatenate(e_list)
         
-        # Výpočet super-tiles
-        st_embs = create_super_tiles(coords, embs)
-        
-        res = {
-            "slide_id": slide_id,
-            "vlad_raw": compute_soft_vlad(embs, v_c),
-            "vlad_super": compute_soft_vlad(st_embs, v_c),
-            "fisher_raw": compute_fisher_vector(embs, f_m, f_c, f_p),
-            "fisher_super": compute_fisher_vector(st_embs, f_m, f_c, f_p)
-        }
-        
-        pd.DataFrame([res]).to_parquet(out_path)
-        return slide_id
+        res = {"slide_id": slide_id}
+        dim = embs_full.shape[1]
+
+        # Rozdělení podle dimenze modelu
+        if dim == 3072: # Midnight
+            configs = {"cls": embs_full[:, :1536], "patch": embs_full[:, 1536:], "hybrid": embs_full}
+        elif dim == 2560: # Virchow
+            configs = {"cls": embs_full[:, :1280], "patch": embs_full[:, 1280:], "hybrid": embs_full}
+        else: # UNI2-h / GigaPath (1536)
+            configs = {"default": embs_full}
+
+        for name, data in configs.items():
+            st_data = create_super_tiles(coords, data)
+
+            # --- FISHER (GMM) ---
+            if name in gmm_refs_dict:
+                # OPRAVA: Načtení referencí ze slovníku a jejich dereference přes ray.get
+                m_ref, cov_ref, p_ref = gmm_refs_dict[name]
+                m, cov, p = ray.get([m_ref, cov_ref, p_ref]) # Dereference najednou pro rychlost
+                
+                res.update(compute_fisher_variants(data, m, cov, p, suffix=name))
+                res.update(compute_fisher_variants(st_data, m, cov, p, suffix=f"{name}_super"))
+
+            # --- VLAD (KMeans) ---
+            if name in vlad_refs_dict:
+                # OPRAVA: Dereference i pro VLAD středy
+                v_centers_ref = vlad_refs_dict[name]
+                v_centers = ray.get(v_centers_ref)
+                
+                res[f"vlad_{name}"] = compute_soft_vlad(data, v_centers)
+                res[f"vlad_{name}_super"] = compute_soft_vlad(st_data, v_centers)
+
+        # Ukládání souboru
+        if len(res) > 1:
+            pd.DataFrame([res]).to_parquet(out_path)
+            # Volitelně: print(f"✅ Uloženo: {out_path.name}") 
+            return slide_id
+        else:
+            return f"Skipped {slide_id}: No data calculated"
+
     except Exception as e:
-        return f"Error {slide_id}: {str(e)}"
+        # V Ray je lepší chybu vyhodit, aby se zobrazila v hlavním logu
+        print(f"🔥 Error processing {f_path}: {e}")
+        raise e
 
 # --- 5. HLAVNÍ FUNKCE ---
-def main():
-    #TODO ASSURE THAT I HAVE ALL TILES IN PARQUET FILES, SOME COULD BE MISSED DUE TO TESTING IF FILE ALREADY EXISTS
-    INPUT_DIR = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced"
-    OUTPUT_DIR = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced_slide_v3" # Nový adresář pro v3
+def compute(input, output):
+    # Změň cestu podle toho, co zrovna procesuješ (Virchow/UNI2/Midnight)
+    INPUT_DIR = input
+    OUTPUT_DIR = output
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     
     if not ray.is_initialized():
-        ray.init(num_cpus=6, object_store_memory=20 * 1024**3,)
+        ray.init(num_cpus=5, object_store_memory=50 * 1024**3)
 
     all_folders = sorted([str(f) for f in Path(INPUT_DIR).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
     
-    print("🧠 Trénuji stabilní codebooky...")
-    sample_folders = all_folders[::5] 
+    # Sběr vzorků
     sample_list = []
-    for f in sample_folders:
+    for f in all_folders[:50]: 
         p_files = list(Path(f).glob("*.parquet"))
         if p_files:
             _, e = safe_read_parquet(p_files[0])
-            # Bereme jen 500 náhodných dlaždic z každého slidu, ať je to pestré
-            idx = np.random.choice(len(e), min(500, len(e)), replace=False)
+            idx = np.random.choice(len(e), min(2000, len(e)), replace=False)
             sample_list.append(e[idx])
     
     all_sample = np.concatenate(sample_list)
+    dim = all_sample.shape[1]
+    half = dim // 2
     
-    print(f"Tvar vzorku: {all_sample.shape}", flush=True)
-    print(f"Typ dat: {all_sample.dtype}")
-    print(f"Obsahuje NaN: {np.isnan(all_sample).any()}")
+    # Definice úloh pro trénink
+    if dim > 2000:
+        train_tasks = {"cls": all_sample[:, :half], "patch": all_sample[:, half:], "hybrid": all_sample}
+    else:
+        train_tasks = {"default": all_sample}
 
-    print(f"Trénuji k-means na {len(all_sample)} vzorcích...")
-    vlad_m = MiniBatchKMeans(n_clusters=64, batch_size=4096, random_state=42, n_init=1).fit(all_sample)
-    print("✅ K-means hotovo.")
+    gmm_refs = {}
+    vlad_refs = {}
 
-    print("Trénuji GMM...")
-    gmm_m = GaussianMixture(n_components=32, covariance_type='diag', random_state=42, max_iter=20, init_params='random').fit(all_sample)
-    print("✅ GMM hotovo.")
+    for name, data in train_tasks.items():
+        print(f"--- Trénuji Codebooky pro větev: {name} (dim {data.shape[1]}) ---")
+        
+        # 1. Trénink K-Means pro VLAD (64 klastrů, n_init=1 pro rychlost)
+        vlad_m = MiniBatchKMeans(n_clusters=64, batch_size=4096, random_state=42, n_init=1).fit(data)
+        vlad_refs[name] = ray.put(vlad_m.cluster_centers_.astype(np.float32))
 
-    print("✅ Codebooky připraveny. Připravuji data pro paralelní zpracování...")
-    # Sdílení v Ray paměti
-    v_c_ref = ray.put(vlad_m.cluster_centers_.astype(np.float32))
-    f_m_ref = ray.put(gmm_m.means_.astype(np.float32))
-    f_c_ref = ray.put(gmm_m.covariances_.astype(np.float32))
-    f_p_ref = ray.put(gmm_m.weights_.astype(np.float32))
-    
-    del all_sample, sample_list
+        # 2. Trénink GMM pro Fishera (32 komponent, reg 1e-3)
+        gmm = GaussianMixture(
+            n_components=32, 
+            covariance_type='diag',
+            max_iter=100,
+            reg_covar=1e-3,
+            random_state=42,
+            init_params='kmeans'
+        ).fit(data)
+        
+        gmm_refs[name] = (
+            ray.put(gmm.means_.astype(np.float32)),
+            ray.put(gmm.covariances_.astype(np.float32)),
+            ray.put(gmm.weights_.astype(np.float32))
+        )
+
+    del all_sample, train_tasks
     gc.collect()
 
-    print(f"🚀 Startuji paralelní zpracování {len(all_folders)} slidů...")
+    print(f"🚀 Startuji zpracování {len(all_folders)} slidů...")
     result_refs = [
-        process_single_slide.remote(f_path, v_c_ref, f_m_ref, f_c_ref, f_p_ref, OUTPUT_DIR) 
+        process_single_slide.remote(f_path, gmm_refs, vlad_refs, OUTPUT_DIR) 
         for f_path in all_folders
     ]
 
@@ -208,8 +278,24 @@ def main():
             results.append(ray.get(done_refs[0]))
             pbar.update(1)
 
-    print(f"✨ Hotovo. Výsledky v: {OUTPUT_DIR}")
     ray.shutdown()
+    print("✨ Hotovo. Máš v Parquetech VLAD i Fisher pro všechny varianty.")
+
+def main():
+    # GIGAPATH
+    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_slides_final"  # Např. "/data/virchow/embeddings"
+    #compute(input_path, output_path)
+#
+    ##VIRCHOW
+    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_clahe"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_clahe_slides_final"  # Např. "/data/virchow/embeddings"
+    #compute(input_path, output_path)
+    
+    #UNI2-H
+    input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_norm"  # Např. "/data/virchow/slides"
+    output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_norm_slides_final"  # Např. "/data/virchow/embeddings"
+    compute(input_path, output_path)
 
 if __name__ == "__main__":
     main()
