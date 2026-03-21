@@ -402,40 +402,64 @@ class GPUPredictor:
         data_stack = self.np.stack(batch['tile'])
         batch_tensor = self.torch.as_tensor(data_stack).to(self.device, non_blocking=True).to(self.dtype)
 
-        if self.encoder_idx == 1: # virchow2
-            with self.torch.no_grad():
-                output = self.model(batch_tensor)  # Výsledek: (Batch, 261, 1280)
-                
-                # 1. Extrakce podle dokumentace
-                class_token = output[:, 0]    # Globální informace
-                patch_tokens = output[:, 5:]  # Lokální informace (přeskočíme registry 1-4)
-                
-                # 2. Agregace lokální informace (průměr přes prostorové tokeny)
-                # Z (Batch, 256, 1280) uděláme (Batch, 1280)
+        expected_len = len(batch['slide_id'])
+
+        with self.torch.no_grad():
+            output = self.model(batch_tensor)
+            
+            # --- VIRCHOW ---
+            if self.encoder_idx == 1:
+                class_token = output[:, 0]
+                patch_tokens = output[:, 5:]
                 patched_avg = patch_tokens.mean(dim=1)
-                
-                # 3. Spojení do finálního embeddingu (Batch, 2560)
                 embedding_tensor = self.torch.cat([class_token, patched_avg], dim=-1)
+            
+            # --- GIGAPATH ---
+            elif self.encoder_idx == 0: # gigapathTile
+                # 1. Odstraníme zbytečné dimenze (např. z [B, 1, 1536] na [B, 1536])
+                # Ale pozor, squeeze() bez indexu by u batch_size=1 zrušil i tu nultou dimenzi.
+                # squeeze(1) je bezpečnější.
+                temp_tensor = output.squeeze(1) if len(output.shape) > 2 else output
+                
+                # 2. KLÍČOVÝ FIX: Pokud GigaPath vrátil 2x víc řádků (128 vs 64)
+                if temp_tensor.shape[0] != expected_len:
+                    embedding_tensor = temp_tensor[:expected_len]
+                else:
+                    embedding_tensor = temp_tensor
+                
+                print(f"DEBUG: Gigapath expected: {expected_len}, final shape: {embedding_tensor.shape}")
 
-            # Uložíme jako float32 pro stabilitu a menší velikost
-            embeddings_array = embedding_tensor.cpu().to(self.torch.float16).numpy()
-            del output, embedding_tensor, batch_tensor
-        
-        else:
-            with self.torch.no_grad():
-                embeddings_tensor = self.model(batch_tensor)
+            # --- MIDNIGHT-12k ---
+            elif self.encoder_idx == 3: # midnight12k
+                output = self.model(batch_tensor)
+                
+                # JEDINÁ POJISTKA: Fix délky (pokud model vrací duplikáty)
+                if output.shape[0] != expected_len:
+                    embedding_tensor = output[:expected_len]
+                else:
+                    embedding_tensor = output
+                
+                # DEBUG pro tvou kontrolu v logu
+                # Mělo by to psát: (Batch, 2304)
+                print(f"DEBUG: Midnight Wrapper Output: {embedding_tensor.shape}")
 
-            # Převod zpět na CPU numpy
-            embeddings_array = embeddings_tensor.cpu().to(torch.float16).numpy()
-            del embeddings_tensor, batch_tensor
+            # --- OSTATNÍ (UNI2h atd.) ---
+            else:
+                embedding_tensor = output
+                # Pokud by UNI2h náhodou vracelo víc tokenů, pojistka:
+                if len(embedding_tensor.shape) == 3:
+                     embedding_tensor = embedding_tensor.mean(dim=1)
 
-        output_df = pd.DataFrame({
+        # Klíčová část: Převod na float16 a CPU
+        embeddings_array = embedding_tensor.cpu().to(self.torch.float16).numpy()
+        del output, embedding_tensor, batch_tensor
+
+        return pd.DataFrame({
             'slide_id': batch['slide_id'],
             'x_coord': batch['x_coord'],
             'y_coord': batch['y_coord'],
-            'embedding': [emb for emb in embeddings_array], # NumPy pole v buňce, ne list!
+            'embedding': list(embeddings_array), # Rychlejší převod na list polí
         })
-        return output_df
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
