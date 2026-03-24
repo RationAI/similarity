@@ -1,301 +1,224 @@
-
-import os
-# MUSÍ BÝT PŘED IMPORTEM NUMPY/SKLEARN
-#os.environ["OMP_NUM_THREADS"] = "1"
-#os.environ["MKL_NUM_THREADS"] = "1"
-#os.environ["OPENBLAS_NUM_THREADS"] = "1"
-
-import ray
+import os, torch, gc, ray
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import random
-import time
-import gc
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.mixture import GaussianMixture
-from sklearn.neighbors import KDTree
 from pathlib import Path
 from tqdm import tqdm
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.mixture import GaussianMixture
+import hnswlib 
 
-# --- FIXACE SEEDU PRO REPRODUKOVATELNOST ---
-random.seed(42)
-np.random.seed(42)
+# Inicializace Ray - automaticky si vezme dostupné prostředky
+# Vynucené vypnutí starého Raye, pokud existuje
+if ray.is_initialized():
+    ray.shutdown()
 
-# --- 1. ŠETRNÉ NAČÍTÁNÍ ---
+# Inicializace s čistým štítem
+ray.init(num_cpus=16, ignore_reinit_error=True, include_dashboard=False)
+
+# Malý trik: vyčištění paměti GPU hned na startu
+torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    torch.cuda.ipc_collect()
+# --- 1. POMOCNÉ FUNKCE (Čtení a Sousedé na CPU) ---
+
 def safe_read_parquet(path):
     table = pq.read_table(path)
-    coords = np.column_stack([
-        table.column('x_coord').to_numpy(),
-        table.column('y_coord').to_numpy()
-    ]).astype(np.float32)
-    
-    raw_col = table.column('embedding').to_pylist()
-    embs_all = np.array(raw_col, dtype=np.float32)
-    
-    if embs_all.ndim == 3:
-        embs_all = embs_all.reshape(-1, embs_all.shape[-1])
+    coords = np.column_stack([table.column('x_coord').to_numpy(), table.column('y_coord').to_numpy()]).astype(np.float32)
+    embs_all = np.vstack(table.column('embedding').to_numpy()).astype(np.float32)
+    if embs_all.ndim == 3: embs_all = embs_all.reshape(-1, embs_all.shape[-1])
+    min_len = min(len(embs_all), len(coords))
+    return coords[:min_len], embs_all[:min_len]
 
-    # Vrátíme surový embedding a souřadnice
-    # (Ořezání na CLS/Patches uděláme až při výpočtu)
-    if len(embs_all) > len(coords):
-        embs_all = embs_all[:len(coords)]
-    elif len(embs_all) < len(coords):
-        coords = coords[:len(embs_all)]
-        
-    return coords, embs_all
-
-def compute_soft_vlad(embeddings, centroids, sigma=1.0):
-    if len(embeddings) == 0: 
-        return np.zeros(centroids.shape[0] * centroids.shape[1], dtype=np.float32)
-    
-    # Vzdálenosti k centrům
-    dots = np.dot(embeddings, centroids.T)
-    emb_sq = np.sum(embeddings**2, axis=1, keepdims=True)
-    cen_sq = np.sum(centroids**2, axis=1)
-    dists_sq = np.maximum(emb_sq + cen_sq - 2 * dots, 0)
-    
-    # Klasický Soft-assignment
-    weights = np.exp(-sigma * dists_sq)
-    weights /= (np.sum(weights, axis=1, keepdims=True) + 1e-12)
-    
-    # Rezidua (rozdíl mezi dlaždicí a klastrem)
-    V = np.dot(weights.T, embeddings) - (weights.sum(axis=0)[:, np.newaxis] * centroids)
-    
-    vlad_flat = V.flatten()
-    vlad_flat = np.sign(vlad_flat) * np.sqrt(np.abs(vlad_flat)) # Power norm
-    
-    norm = np.linalg.norm(vlad_flat)
-    return (vlad_flat / (norm + 1e-6)).astype(np.float32)
-
-import numpy as np
-
-def compute_fisher_variants(embeddings, means, covs, priors, suffix=""):
-    N, D = embeddings.shape
-    # Soft assignment
-    # Místo původního resps výpočtu:
-    dists = -0.5 * np.sum((embeddings[:, np.newaxis, :] - means)**2 / (covs + 1e-3), axis=2)
-    # Stabilní výpočet pravděpodobností
-    max_dists = np.max(dists, axis=1, keepdims=True)
-    resps = np.exp(dists - max_dists) 
-    resps /= (resps.sum(axis=1, keepdims=True) + 1e-12)
-    resps_sum = resps.sum(axis=0)
-
-    # u_k (středy)
-    u_k = (np.dot(resps.T, embeddings) - resps_sum[:, np.newaxis] * means)
-    u_k /= (N * np.sqrt(priors)[:, np.newaxis] + 1e-8)
-
-    # v_k (rozptyl - s regulací 1e-3)
-    v_k = np.zeros_like(u_k)
-    for k in range(len(priors)):
-        diff = embeddings - means[k]
-        v_k[k] = np.dot(resps[:, k], (diff**2 / (covs[k] + 1e-3)) - 1.0)
-    v_k /= (N * np.sqrt(2 * priors)[:, np.newaxis] + 1e-8)
-
-    def finalize(v):
-        v = np.sign(v) * np.sqrt(np.abs(v))
-        norm = np.linalg.norm(v)
-        return v / (norm + 1e-8) if norm > 1e-8 else v
-
-    s = f"_{suffix}" if suffix else ""
-    return {
-        f"fisher_mean{s}": finalize(u_k.flatten()),
-        f"fisher_var{s}": finalize(v_k.flatten()),
-        f"fisher_robust{s}": finalize(np.concatenate([u_k.flatten(), v_k.flatten()]))
-    }
-
-# --- 3. RYCHLÝ FISHER VECTOR ---
-def compute_fisher_vector(embeddings, means, covs, priors):
-    if len(embeddings) == 0: 
-        return np.zeros(2 * means.shape[0] * means.shape[1], dtype=np.float32)
-    
-    N, D = embeddings.shape
-    inv_covs = 1.0 / (covs + 1e-6)
-    
-    dots = np.dot(embeddings, (means * inv_covs).T)
-    emb_sq = np.dot(embeddings**2, inv_covs.T)
-    means_sq = np.sum(means**2 * inv_covs, axis=1)
-    
-    dists_sq = np.maximum(emb_sq - 2 * dots + means_sq, 0)
-    resps = np.exp(-0.5 * dists_sq) * priors / (np.sqrt(np.prod(covs, axis=1)) + 1e-6)
-    resps /= (resps.sum(axis=1, keepdims=True) + 1e-12)
-    
-    resps_sum = resps.sum(axis=0)[:, np.newaxis]
-    u_k = (np.dot(resps.T, embeddings) - resps_sum * means) / (N * np.sqrt(priors)[:, np.newaxis] + 1e-6)
-    
-    term2 = np.dot(resps.T, embeddings**2) - 2 * means * np.dot(resps.T, embeddings) + resps_sum * means**2
-    v_k = (term2 * inv_covs - resps_sum) / (N * np.sqrt(2 * priors)[:, np.newaxis] + 1e-6)
-    
-    fv = np.concatenate([u_k.flatten(), v_k.flatten()])
-    fv = np.sign(fv) * np.sqrt(np.abs(fv))
-    return (fv / (np.linalg.norm(fv) + 1e-6)).astype(np.float32)
-
-# --- 4. SUPER-TILES (RADIUS) ---
-def create_super_tiles(coords, embs, k=10):
+def create_super_tiles_cpu(coords, embs, k=10):
     if len(coords) < k: return embs
-    tree = KDTree(coords)
-    _, indices = tree.query(coords, k=k)
+    N, D = coords.shape
+    index = hnswlib.Index(space='l2', dim=D)
+    index.init_index(max_elements=N, ef_construction=100, M=16)
+    index.add_items(coords)
+    indices, _ = index.knn_query(coords, k=k)
     return np.mean(embs[indices], axis=1).astype(np.float32)
 
-@ray.remote
-def process_single_slide(f_path, gmm_refs_dict, vlad_refs_dict, out_dir):
+# --- 2. RAY WORKERS (Paralelní části) ---
+
+@ray.remote(num_cpus=2) # Načítání a HNSW na CPU
+def load_and_prepare(f_path, out_dir):
     try:
         slide_id = os.path.basename(f_path).replace("slide_id=", "")
         out_path = Path(out_dir) / f"{slide_id.replace('/', '_')}.parquet"
-        
-        if out_path.exists(): 
-            return slide_id
+        if out_path.exists(): return "Skip"
 
-        # Změna na iterdir, aby to našlo soubory i bez přípony .parquet (časté u Ray Datasetů)
-        p_files = [f for f in Path(f_path).iterdir() if f.is_file() and not f.name.startswith(".")]
-        if not p_files:
-            return f"Skipped {slide_id}: No files found"
+        # Načtení všech parquetů ve složce slidu
+        p_files = list(Path(f_path).glob("*.parquet"))
+        if not p_files: return None
 
         c_list, e_list = [], []
         for pf in p_files:
-            c, e = safe_read_parquet(pf) 
-            c_list.append(c)
-            e_list.append(e)
+            c, e = safe_read_parquet(pf)
+            c_list.append(c); e_list.append(e)
         
         coords = np.concatenate(c_list)
-        embs_full = np.concatenate(e_list)
+        data = np.concatenate(e_list)
         
-        res = {"slide_id": slide_id}
-        dim = embs_full.shape[1]
-
-        # Rozdělení podle dimenze modelu
-        if dim == 3072: # Midnight
-            configs = {"cls": embs_full[:, :1536], "patch": embs_full[:, 1536:], "hybrid": embs_full}
-        elif dim == 2560: # Virchow
-            configs = {"cls": embs_full[:, :1280], "patch": embs_full[:, 1280:], "hybrid": embs_full}
-        else: # UNI2-h / GigaPath (1536)
-            configs = {"default": embs_full}
-
-        for name, data in configs.items():
-            st_data = create_super_tiles(coords, data)
-
-            # --- FISHER (GMM) ---
-            if name in gmm_refs_dict:
-                # OPRAVA: Načtení referencí ze slovníku a jejich dereference přes ray.get
-                m_ref, cov_ref, p_ref = gmm_refs_dict[name]
-                m, cov, p = ray.get([m_ref, cov_ref, p_ref]) # Dereference najednou pro rychlost
-                
-                res.update(compute_fisher_variants(data, m, cov, p, suffix=name))
-                res.update(compute_fisher_variants(st_data, m, cov, p, suffix=f"{name}_super"))
-
-            # --- VLAD (KMeans) ---
-            if name in vlad_refs_dict:
-                # OPRAVA: Dereference i pro VLAD středy
-                v_centers_ref = vlad_refs_dict[name]
-                v_centers = ray.get(v_centers_ref)
-                
-                res[f"vlad_{name}"] = compute_soft_vlad(data, v_centers)
-                res[f"vlad_{name}_super"] = compute_soft_vlad(st_data, v_centers)
-
-        # Ukládání souboru
-        if len(res) > 1:
-            pd.DataFrame([res]).to_parquet(out_path)
-            # Volitelně: print(f"✅ Uloženo: {out_path.name}") 
-            return slide_id
-        else:
-            return f"Skipped {slide_id}: No data calculated"
-
+        # Sousedé bleskově na CPU
+        data_super = create_super_tiles_cpu(coords, data)
+        return slide_id, data, data_super, out_path
     except Exception as e:
-        # V Ray je lepší chybu vyhodit, aby se zobrazila v hlavním logu
-        print(f"🔥 Error processing {f_path}: {e}")
-        raise e
+        return f"Error: {e}"
 
-# --- 5. HLAVNÍ FUNKCE ---
-def compute(input, output):
-    # Změň cestu podle toho, co zrovna procesuješ (Virchow/UNI2/Midnight)
-    INPUT_DIR = input
-    OUTPUT_DIR = output
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-    
-    if not ray.is_initialized():
-        ray.init(num_cpus=5, object_store_memory=50 * 1024**3)
+@ray.remote(num_gpus=1)
+class GPUWorker:
+    def __init__(self, gmm_params, vlad_centers):
+        self.device = torch.device("cuda")
+        m, c, p = gmm_params
+        self.m = torch.from_numpy(m).to(self.device)
+        self.c = torch.from_numpy(c).to(self.device) + 1e-6
+        self.p = torch.from_numpy(p).to(self.device)
+        self.vlad_centers = torch.from_numpy(vlad_centers).to(self.device)
 
-    all_folders = sorted([str(f) for f in Path(INPUT_DIR).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
+    def compute_slide(self, slide_id, data_raw, data_super, out_path):
+        try:
+            res = {"slide_id": slide_id}
+            chunk_size = 5000  # Bezpečná hodnota pro 1280-dim embs
+            
+            for name, data in [("default", data_raw), ("default_super", data_super)]:
+                # Převod na tensor a normalizace
+                X_full = torch.from_numpy(data).to(self.device)
+                X_full = X_full / (torch.norm(X_full, dim=1, keepdim=True) + 1e-8)
+                N, D = X_full.shape
+                K_gmm = self.m.shape[0]
+                K_vlad = self.vlad_centers.shape[0]
+
+                # --- 1. FISHER VECTOR (Chunked) ---
+                sum_resp = torch.zeros(K_gmm, device=self.device)
+                sum_u_k = torch.zeros((K_gmm, D), device=self.device)
+                
+                with torch.no_grad():
+                    for i in range(0, N, chunk_size):
+                        X = X_full[i : i + chunk_size]
+                        # Fisher log-likelihoods
+                        diff = X.unsqueeze(1) - self.m.unsqueeze(0) # (chunk, 32, D)
+                        log_exps = -0.5 * torch.sum(diff**2 / self.c, dim=2)
+                        resps = torch.softmax(log_exps, dim=1) # (chunk, 32)
+                        
+                        sum_resp += resps.sum(dim=0)
+                        sum_u_k += torch.matmul(resps.t(), X)
+                        del diff, log_exps, resps # Okamžité uvolnění paměti
+
+                    u_k = sum_u_k - (sum_resp.unsqueeze(1) * self.m)
+                    fv = u_k.flatten().cpu().numpy()
+                    fv = np.sign(fv) * np.sqrt(np.abs(fv))
+                    res[f"fisher_{name}"] = fv / (np.linalg.norm(fv) + 1e-8)
+
+                # --- 2. VLAD (Chunked) ---
+                all_idx = []
+                with torch.no_grad():
+                    for i in range(0, N, chunk_size):
+                        X = X_full[i : i + chunk_size]
+                        dists = torch.cdist(X, self.vlad_centers)
+                        all_idx.append(torch.argmin(dists, dim=1))
+                    
+                    idx = torch.cat(all_idx)
+                    oh = torch.nn.functional.one_hot(idx, num_classes=K_vlad).float()
+                    
+                    sum_x_vlad = torch.matmul(oh.t(), X_full)
+                    counts = oh.sum(dim=0).unsqueeze(1)
+                    V = sum_x_vlad - (counts * self.vlad_centers)
+                    
+                    v = V.flatten().cpu().numpy()
+                    v = np.sign(v) * np.sqrt(np.abs(v))
+                    res[f"vlad_{name}"] = v / (np.linalg.norm(v) + 1e-8)
+                
+                # Vyčištění po jedné variantě (raw/super)
+                del X_full, oh, sum_x_vlad, V
+                torch.cuda.empty_cache()
+
+            pd.DataFrame([res]).to_parquet(out_path)
+            return f"Done: {slide_id}"
+            
+        except Exception as e:
+            # Pokud se stane chyba, zkusíme aspoň vyčistit VRAM pro další slide
+            torch.cuda.empty_cache()
+            return f"GPU Error {slide_id}: {str(e)}"
+# --- 3. HLAVNÍ LOGIKA ---
+
+def compute(input_dir, output_dir):
+    print(f"\n--- RAY PIPELINE START: {input_dir} ---")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    all_folders = sorted([str(f) for f in Path(input_dir).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
     
-    # Sběr vzorků
+    # TRÉNINK (CPU)
     sample_list = []
-    for f in all_folders[:50]: 
+    for f in all_folders[:50]:
         p_files = list(Path(f).glob("*.parquet"))
         if p_files:
             _, e = safe_read_parquet(p_files[0])
-            idx = np.random.choice(len(e), min(2000, len(e)), replace=False)
-            sample_list.append(e[idx])
+            e = e / (np.linalg.norm(e, axis=1, keepdims=True) + 1e-8)
+            sample_list.append(e[np.random.choice(len(e), min(2000, len(e)), replace=False)])
     
     all_sample = np.concatenate(sample_list)
-    dim = all_sample.shape[1]
-    half = dim // 2
+    v_m = MiniBatchKMeans(n_clusters=64, batch_size=1024, n_init=1).fit(all_sample)
+    g = GaussianMixture(n_components=32, covariance_type='diag', max_iter=100).fit(all_sample)
     
-    # Definice úloh pro trénink
-    if dim > 2000:
-        train_tasks = {"cls": all_sample[:, :half], "patch": all_sample[:, half:], "hybrid": all_sample}
-    else:
-        train_tasks = {"default": all_sample}
+    gmm_params = (g.means_.astype(np.float32), g.covariances_.astype(np.float32), g.weights_.astype(np.float32))
+    vlad_centers = v_m.cluster_centers_.astype(np.float32)
+    
+    # Inicializace GPU herce
+    worker = GPUWorker.remote(gmm_params, vlad_centers)
 
-    gmm_refs = {}
-    vlad_refs = {}
+    # 1. Spustíme VŠECHNY loadery naráz (Ray si je bude dávkovat podle CPU jader)
+    # Každý loader si vezme 2 CPU (podle @ray.remote(num_cpus=2))
+    loader_futures = [load_and_prepare.remote(f, output_dir) for f in all_folders]
 
-    for name, data in train_tasks.items():
-        print(f"--- Trénuji Codebooky pro větev: {name} (dim {data.shape[1]}) ---")
-        
-        # 1. Trénink K-Means pro VLAD (64 klastrů, n_init=1 pro rychlost)
-        vlad_m = MiniBatchKMeans(n_clusters=64, batch_size=4096, random_state=42, n_init=1).fit(data)
-        vlad_refs[name] = ray.put(vlad_m.cluster_centers_.astype(np.float32))
+    # 2. Použijeme ray.wait, abychom brali to, co je zrovna hotové
+    with tqdm(total=len(all_folders), desc="Pipeline") as pbar:
+        while loader_futures:
+            # Vezmeme slidy, které už CPU dožvýkalo (vratí jeden hotový a zbytek čekajících)
+            ready_list, loader_futures = ray.wait(loader_futures, num_returns=1)
+            
+            result = ray.get(ready_list[0])
+            if isinstance(result, tuple): # Úspěšně načteno a HNSW hotovo
+                s_id, raw, sup, out_p = result
+                # GPU teď dostane "čistou práci" bez čekání na disk
+                # Tady ray.get() necháme, aby GPU jelo jeden po druhém a nepřeplnilo VRAM
+                status = ray.get(worker.compute_slide.remote(s_id, raw, sup, out_p))
+                print(status)
+            else:
+                print(result) # Může být "Skip" nebo chyba načítání
 
-        # 2. Trénink GMM pro Fishera (32 komponent, reg 1e-3)
-        gmm = GaussianMixture(
-            n_components=32, 
-            covariance_type='diag',
-            max_iter=100,
-            reg_covar=1e-3,
-            random_state=42,
-            init_params='kmeans'
-        ).fit(data)
-        
-        gmm_refs[name] = (
-            ray.put(gmm.means_.astype(np.float32)),
-            ray.put(gmm.covariances_.astype(np.float32)),
-            ray.put(gmm.weights_.astype(np.float32))
-        )
-
-    del all_sample, train_tasks
-    gc.collect()
-
-    print(f"🚀 Startuji zpracování {len(all_folders)} slidů...")
-    result_refs = [
-        process_single_slide.remote(f_path, gmm_refs, vlad_refs, OUTPUT_DIR) 
-        for f_path in all_folders
-    ]
-
-    results = []
-    with tqdm(total=len(result_refs)) as pbar:
-        while len(result_refs) > 0:
-            done_refs, result_refs = ray.wait(result_refs, num_returns=1)
-            results.append(ray.get(done_refs[0]))
             pbar.update(1)
-
-    ray.shutdown()
-    print("✨ Hotovo. Máš v Parquetech VLAD i Fisher pro všechny varianty.")
 
 def main():
     # GIGAPATH
     #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg"  # Např. "/data/virchow/slides"
     #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_slides_final"  # Např. "/data/virchow/embeddings"
     #compute(input_path, output_path)
-#
-    ##VIRCHOW
-    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_clahe"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_clahe_slides_final"  # Např. "/data/virchow/embeddings"
+
+    #VIRCHOW
+    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_enhanced"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
     #compute(input_path, output_path)
+#
+    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
+    #compute(input_path, output_path)
+
+    input_path = "/data/fs201053/jb88526/privagams_enc1_mpp05_enhanced"  # Např. "/data/virchow/slides"
+    output_path = "/data/fs201053/jb88526/privagams_enc1_mpp05_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
+    compute(input_path, output_path)
     
     #UNI2-H
-    input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_norm"  # Např. "/data/virchow/slides"
-    output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_norm_slides_final"  # Např. "/data/virchow/embeddings"
-    compute(input_path, output_path)
+    #input_path = "/data/fs201053/jb88526/privagams_enc2_mpp10_enhanced"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc2_mpp10_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
+    #compute(input_path, output_path)
+#
+    #input_path = "/data/fs201053/jb88526/privagams_enc2_mpp20_enhanced"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc2_mpp20_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
+    #compute(input_path, output_path)
+#
+    #input_path = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced"  # Např. "/data/virchow/slides"
+    #output_path = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
+    #compute(input_path, output_path)
 
 if __name__ == "__main__":
     main()
