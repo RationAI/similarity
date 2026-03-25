@@ -571,9 +571,9 @@ def main() -> None:
     #    }
     #}
     runtime_env = {}
-    logging.getLogger("ray").setLevel(logging.ERROR)
-    logging.getLogger("ray.data").setLevel(logging.ERROR)
-    logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
+    #logging.getLogger("ray").setLevel(logging.ERROR)
+    #logging.getLogger("ray.data").setLevel(logging.ERROR)
+    #logging.getLogger("ray._private.state_accelerator_v2").setLevel(logging.ERROR)
 
     ray.init(runtime_env=runtime_env, logging_level=logging.ERROR, configure_logging=True, object_store_memory=20 * 1024**3) #TODO make bigger on h100?
 
