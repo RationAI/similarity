@@ -110,7 +110,7 @@ pytz==2025.2
 pyvips==3.0.0
 pyyaml==6.0.2
 pyzmq==27.1.0
-drationai-staining @ git+ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git@496b9297d2bf750e7130c5ddba05d1bd204e4ca7
+rationai-staining @ git+ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git
 ratiopath==1.0.3
 ray==2.49.2
 referencing==0.36.2
