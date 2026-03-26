@@ -14,7 +14,7 @@ from PIL import Image
 from typing import Any
 from ratiopath.ray import read_slides
 from ratiopath.tiling import grid_tiles, read_slide_tiles
-from rationai.staining import ColorConversion, normalize_staining
+from rationai.staining import StandardConversions, normalize_staining
 from dataclasses import dataclass, asdict
 import urllib.parse
 
@@ -190,7 +190,7 @@ class TileEncoderActor:
             # 2. Normalizace (pokud vrací PIL, převedeme na numpy pro CLAHE)
             if self.NORMALIZE:
                 current_tile = normalize_staining(
-                    current_tile, ColorConversion.RGB2HER.matrix, 
+                    current_tile, StandardConversions.RGB2HER.matrix, 
                     self.STAIN_VECTORS[0], self.STAIN_VECTORS[1]
                 )
                 if not isinstance(current_tile, np.ndarray):
