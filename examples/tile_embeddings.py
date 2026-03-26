@@ -289,14 +289,14 @@ class CPUPreprocessActor:
         import cv2
         import numpy as np
         from PIL import Image
-        from rationai.staining import ColorConversion, normalize_staining
+        from rationai.staining import StandardConversions, normalize_staining
         from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k
 
         self.cv2 = cv2
         self.np = np
         self.Image = Image
         self.normalize_staining = normalize_staining
-        self.ColorConversion = ColorConversion
+        self.StandardConversions = StandardConversions
         
         self.NORMALIZE = NORMALIZE
         self.CLAHE = CLAHE
@@ -346,7 +346,7 @@ class CPUPreprocessActor:
                 continue
 
             if self.NORMALIZE:
-                tile_data = self.normalize_staining(tile_data, self.ColorConversion.RGB2HER.matrix, self.STAIN_VECTORS[0], self.STAIN_VECTORS[1])
+                tile_data = self.normalize_staining(tile_data, self.StandardConversions.RGB2HER.matrix, self.STAIN_VECTORS[0], self.STAIN_VECTORS[1])
                 if not isinstance(tile_data, self.np.ndarray): tile_data = self.np.array(tile_data)
 
             if self.CLAHE:
