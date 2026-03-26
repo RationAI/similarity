@@ -32,6 +32,7 @@ gigapath @ git+https://github.com/jiribuchta/prov-gigapath.git@d0719067bbe192e3b
 google-auth==2.43.0
 halo==0.0.31
 hf-xet==1.1.5
+hnswlib==0.8.0
 huggingface-hub==0.35.3
 hydra-core==1.3.2
 idna==3.10
@@ -109,6 +110,7 @@ pytz==2025.2
 pyvips==3.0.0
 pyyaml==6.0.2
 pyzmq==27.1.0
+rationai-kube-jobs @ git+ssh://git@gitlab.ics.muni.cz/rationai/infrastructure/kube-jobs@d7a082700a1234f714c0ca3d3d2bf0b9f957c87d
 rationai-staining @ git+ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git@496b9297d2bf750e7130c5ddba05d1bd204e4ca7
 ratiopath==1.0.3
 ray==2.49.2

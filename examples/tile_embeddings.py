@@ -645,7 +645,7 @@ def main() -> None:
             compute=ray.data.ActorPoolStrategy(size=1), # Vytvoří 2 samostatné Aktory
             num_gpus=1,  # Každý Aktor dostane jednu celou GPU
             num_cpus=1,    # Každý Aktor dostane 2 CPU pro komunikaci s GPU
-            batch_size=64
+            batch_size=16
         )
 
         # 2. Samotný zápis
