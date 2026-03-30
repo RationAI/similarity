@@ -189,36 +189,57 @@ def compute(input_dir, output_dir):
             pbar.update(1)
 
 def main():
-    # GIGAPATH
-    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_rmbg_slides_final"  # Např. "/data/virchow/embeddings"
-    #compute(input_path, output_path)
 
-    #VIRCHOW
-    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_enhanced"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp10_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
-    #compute(input_path, output_path)
-#
-    #input_path = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc1_mpp20_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
-    #compute(input_path, output_path)
-
-    input_path = "/data/fs201053/jb88526/privagams_enc1_mpp05_enhanced"  # Např. "/data/virchow/slides"
-    output_path = "/data/fs201053/jb88526/privagams_enc1_mpp05_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
+    input_path = "/mnt/projects/ri_scale/privagams/breast_enc0"
+    output_path = "/mnt/projects/ri_scale/privagams/breast_enc0_slides_v4"
     compute(input_path, output_path)
-    
-    #UNI2-H
-    #input_path = "/data/fs201053/jb88526/privagams_enc2_mpp10_enhanced"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc2_mpp10_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
-    #compute(input_path, output_path)
-#
-    #input_path = "/data/fs201053/jb88526/privagams_enc2_mpp20_enhanced"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc2_mpp20_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
-    #compute(input_path, output_path)
-#
-    #input_path = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced"  # Např. "/data/virchow/slides"
-    #output_path = "/data/fs201053/jb88526/privagams_enc2_mpp05_enhanced_slides_v4"  # Např. "/data/virchow/embeddings"
-    #compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/breast_enc1"
+    output_path = "/mnt/projects/ri_scale/privagams/breast_enc1_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/breast_enc2"
+    output_path = "/mnt/projects/ri_scale/privagams/breast_enc2_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/breast_enc3"
+    output_path = "/mnt/projects/ri_scale/privagams/breast_enc3_slides_v4"
+    compute(input_path, output_path)
+
+
+    input_path = "/mnt/projects/ri_scale/privagams/colon_enc0"
+    output_path = "/mnt/projects/ri_scale/privagams/colon_enc0_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/colon_enc1"
+    output_path = "/mnt/projects/ri_scale/privagams/colon_enc1_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/colon_enc2"
+    output_path = "/mnt/projects/ri_scale/privagams/colon_enc2_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/colon_enc3"
+    output_path = "/mnt/projects/ri_scale/privagams/colon_enc3_slides_v4"
+    compute(input_path, output_path)
+
+
+
+    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc0"
+    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc0_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc1"
+    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc1_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc2"
+    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc2_slides_v4"
+    compute(input_path, output_path)
+
+    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc3"
+    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc3_slides_v4"
+    compute(input_path, output_path)
 
 if __name__ == "__main__":
     main()
