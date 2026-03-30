@@ -7,6 +7,7 @@ from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.mixture import GaussianMixture
 import hnswlib 
+import argparse
 
 # Inicializace Ray - automaticky si vezme dostupné prostředky
 # Vynucené vypnutí starého Raye, pokud existuje
@@ -189,56 +190,28 @@ def compute(input_dir, output_dir):
             pbar.update(1)
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Creates tile and slide embeddings for WSI"
+    )
+    
+    parser.add_argument(
+        '--slide-path', 
+        type=str, 
+        required=True,
+        help='Absolute path to WSI. can be an directory with WSIs.'
+    )
+    
+    parser.add_argument(
+        '--save-path', 
+        type=str, 
+        default='./',
+        help='Path for saving parquet files, folder for each WSI will be created automatically.'
+    )
 
-    input_path = "/mnt/projects/ri_scale/privagams/breast_enc0"
-    output_path = "/mnt/projects/ri_scale/privagams/breast_enc0_slides_v4"
-    compute(input_path, output_path)
+    args = parser.parse_args()
 
-    input_path = "/mnt/projects/ri_scale/privagams/breast_enc1"
-    output_path = "/mnt/projects/ri_scale/privagams/breast_enc1_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/breast_enc2"
-    output_path = "/mnt/projects/ri_scale/privagams/breast_enc2_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/breast_enc3"
-    output_path = "/mnt/projects/ri_scale/privagams/breast_enc3_slides_v4"
-    compute(input_path, output_path)
-
-
-    input_path = "/mnt/projects/ri_scale/privagams/colon_enc0"
-    output_path = "/mnt/projects/ri_scale/privagams/colon_enc0_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/colon_enc1"
-    output_path = "/mnt/projects/ri_scale/privagams/colon_enc1_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/colon_enc2"
-    output_path = "/mnt/projects/ri_scale/privagams/colon_enc2_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/colon_enc3"
-    output_path = "/mnt/projects/ri_scale/privagams/colon_enc3_slides_v4"
-    compute(input_path, output_path)
-
-
-
-    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc0"
-    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc0_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc1"
-    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc1_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc2"
-    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc2_slides_v4"
-    compute(input_path, output_path)
-
-    input_path = "/mnt/projects/ri_scale/privagams/prostate_enc3"
-    output_path = "/mnt/projects/ri_scale/privagams/prostate_enc3_slides_v4"
+    input_path = args.slide_path.rstrip("/"),
+    output_path = args.save_path.rstrip("/"),
     compute(input_path, output_path)
 
 if __name__ == "__main__":
