@@ -274,11 +274,6 @@ def get_processing_tasks(config: Config):
                 else:
                     print(f"Skipping already processed slide: {path.name}")
                     pass
-    else:
-        if path.suffix.lower() == ".tiff":
-            tiff_tasks.append((str(input_path), str(output_base)))
-        else:
-            tasks.append((str(input_path), str(output_base)))
 
     print(f"Total tasks to process: {len(tasks)+len(tiff_tasks)}")
     return tasks, tiff_tasks
