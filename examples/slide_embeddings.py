@@ -210,8 +210,8 @@ def main():
 
     args = parser.parse_args()
 
-    input_path = args.slide_path.rstrip("/"),
-    output_path = args.save_path.rstrip("/"),
+    input_path = args.slide_path.rstrip("/")
+    output_path = args.save_path.rstrip("/")
     compute(input_path, output_path)
 
 if __name__ == "__main__":
