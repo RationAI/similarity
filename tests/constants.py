@@ -1,6 +1,18 @@
-SCANNER_X_CASE_1 = "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs"
-SCANNER_X_CASE_2 = "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6915-02-T.mrxs"
-SCANNER_X_CASE_3 = "/mnt/data/scans/AI scans/Comparison_of_scanners/colon/FLASH2021_5638-02-T.mrxs"
-SCANNER_Y_CASE_1 = "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/MIDI2021_6802-01-T.mrxs"
-SCANNER_Y_CASE_2 = "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/MIDI2021_6915-02-T.mrxs"
-SCANNER_Y_CASE_3 = "/mnt/data/scans/AI scans/Comparison_of_scanners/colon/MIDI2021_5638-02-T.mrxs"
+SCANNER_X_CASE_1 = (
+    "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6802-01-T.mrxs"
+)
+SCANNER_X_CASE_2 = (
+    "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/FLASH2021_6915-02-T.mrxs"
+)
+SCANNER_X_CASE_3 = (
+    "/mnt/data/scans/AI scans/Comparison_of_scanners/colon/FLASH2021_5638-02-T.mrxs"
+)
+SCANNER_Y_CASE_1 = (
+    "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/MIDI2021_6802-01-T.mrxs"
+)
+SCANNER_Y_CASE_2 = (
+    "/mnt/data/scans/AI scans/Comparison_of_scanners/breast/MIDI2021_6915-02-T.mrxs"
+)
+SCANNER_Y_CASE_3 = (
+    "/mnt/data/scans/AI scans/Comparison_of_scanners/colon/MIDI2021_5638-02-T.mrxs"
+)
