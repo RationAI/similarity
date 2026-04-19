@@ -109,11 +109,17 @@ def main():
     parser.add_argument('--num-runs', type=int, default=20)
     args = parser.parse_args()
     
-    ray.init(num_cpus=16)
+ray.init(num_cpus=16, _system_config={"object_spilling_config": "{}"}) 
+
     all_folders = sorted([str(f) for f in Path(args.slide_path).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
     
-    print("--- Fáze 0: Načtení dat do RAM (jednorázově) ---")
-    loaded_data = [r for r in ray.get([load_and_prepare_worker.remote(f) for f in all_folders]) if isinstance(r, tuple)]
+    # 1. Nejdřív načteme jen vzorek pro trénink slovníků (aby to nezamrzlo)
+    print("--- Fáze 1: Načítání vzorku pro trénink ---")
+    training_samples_futures = [load_and_prepare_worker.remote(f) for f in all_folders[:40]]
+    training_data = [r for r in ray.get(training_samples_futures) if isinstance(r, tuple)]
+    
+    # Uvolníme futures z paměti
+    del training_samples_futures
 
     for run_idx in range(args.num_runs):
         current_seed = 42 + run_idx
@@ -123,9 +129,8 @@ def main():
         
         print(f"\n>>> SPUŠTĚNÍ {run_idx+1}/{args.num_runs} (Seed: {current_seed})")
 
-        # Fáze 2: Trénink slovníků s novým seedem
-        # Výběr náhodných dlaždic je ovlivněn set_seed
-        sample = np.concatenate([d[1][np.random.choice(len(d[1]), min(500, len(d[1])), replace=False)] for d in loaded_data[:40]])
+        # Trénink slovníků (používáme training_data z RAM)
+        sample = np.concatenate([d[1][np.random.choice(len(d[1]), min(500, len(d[1])), replace=False)] for d in training_data])
         pca = PCA(n_components=128, random_state=current_seed).fit(sample)
         s_pca = pca.transform(sample)
         s_pca /= (np.linalg.norm(s_pca, axis=1, keepdims=True) + 1e-8)
@@ -136,12 +141,19 @@ def main():
 
         worker = FullGPUWorker.remote(pca.components_.astype(np.float32), pca.mean_.astype(np.float32), gmm_p, vlad_c.astype(np.float32))
         
-        # Fáze 3: Inference
-        for s_id, raw, sup in tqdm(loaded_data, desc=f"Run {current_seed}"):
-            ray.get(worker.compute_slide.remote(s_id, raw, sup, run_save_dir / f"{s_id}.parquet"))
+        # 2. INFERENCE: Místo ray.get(všechno) to budeme pouštět po jednom
+        # Tím zabráníme ucpání Ray Object Store
+        for f_path in tqdm(all_folders, desc=f"Run {current_seed}"):
+            # Načteme jeden slide
+            ready = ray.get(load_and_prepare_worker.remote(f_path))
+            if isinstance(ready, tuple):
+                s_id, raw, sup = ready
+                # Spočítáme na GPU a hned uvolníme
+                ray.get(worker.compute_slide.remote(s_id, raw, sup, run_save_dir / f"{s_id}.parquet"))
+                del raw, sup, ready # Explicitní smazání velkých polí
         
-        # Vyčištění GPU herce pro další seed
         ray.kill(worker)
+        gc.collect()
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
