@@ -109,7 +109,7 @@ def main():
     parser.add_argument('--num-runs', type=int, default=20)
     args = parser.parse_args()
     
-ray.init(num_cpus=16, _system_config={"object_spilling_config": "{}"}) 
+    ray.init(num_cpus=16, _system_config={"object_spilling_config": "{}"}) 
 
     all_folders = sorted([str(f) for f in Path(args.slide_path).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
     
