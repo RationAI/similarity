@@ -131,7 +131,12 @@ def main():
         s_pca /= (np.linalg.norm(s_pca, axis=1, keepdims=True) + 1e-8)
         
         vlad_c = MiniBatchKMeans(n_clusters=64, n_init=1, random_state=current_seed).fit(s_pca).cluster_centers_
-        gmm = GaussianMixture(n_components=32, covariance_type='diag', random_state=current_seed).fit(s_pca)
+        gmm = GaussianMixture(
+            n_components=32, 
+            covariance_type='diag', 
+            random_state=current_seed,
+            reg_covar=1e-4
+        ).fit(s_pca)
         gmm_p = (gmm.means_.astype(np.float32), gmm.covariances_.astype(np.float32), gmm.weights_.astype(np.float32))
 
         worker = FullGPUWorker.remote(pca.components_.astype(np.float32), pca.mean_.astype(np.float32), gmm_p, vlad_c.astype(np.float32))
