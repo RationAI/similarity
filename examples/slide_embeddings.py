@@ -80,7 +80,7 @@ class GPUWorker:
     def compute_slide(self, slide_id, data_raw, data_super, out_path):
         try:
             res = {"slide_id": slide_id}
-            chunk_size = 5000  # Bezpečná hodnota pro 1280-dim embs
+            chunk_size = 1000  
             
             for name, data in [("default", data_raw), ("default_super", data_super)]:
                 # Převod na tensor a normalizace
@@ -90,28 +90,32 @@ class GPUWorker:
                 K_gmm = self.m.shape[0]
                 K_vlad = self.vlad_centers.shape[0]
 
-                # --- 1. FISHER VECTOR (Chunked) ---
+                # --- 1. MEAN POOLING ---
+                with torch.no_grad():
+                    mean_emb = torch.mean(X_full, dim=0).cpu().numpy()
+                    res[f"mean_{name}"] = mean_emb / (np.linalg.norm(mean_emb) + 1e-8)
+
+                # --- 2. FISHER VECTOR (Chunked) ---
                 sum_resp = torch.zeros(K_gmm, device=self.device)
                 sum_u_k = torch.zeros((K_gmm, D), device=self.device)
                 
                 with torch.no_grad():
                     for i in range(0, N, chunk_size):
                         X = X_full[i : i + chunk_size]
-                        # Fisher log-likelihoods
-                        diff = X.unsqueeze(1) - self.m.unsqueeze(0) # (chunk, 32, D)
+                        diff = X.unsqueeze(1) - self.m.unsqueeze(0) 
                         log_exps = -0.5 * torch.sum(diff**2 / self.c, dim=2)
-                        resps = torch.softmax(log_exps, dim=1) # (chunk, 32)
+                        resps = torch.softmax(log_exps, dim=1) 
                         
                         sum_resp += resps.sum(dim=0)
                         sum_u_k += torch.matmul(resps.t(), X)
-                        del diff, log_exps, resps # Okamžité uvolnění paměti
+                        del diff, log_exps, resps 
 
                     u_k = sum_u_k - (sum_resp.unsqueeze(1) * self.m)
                     fv = u_k.flatten().cpu().numpy()
                     fv = np.sign(fv) * np.sqrt(np.abs(fv))
                     res[f"fisher_{name}"] = fv / (np.linalg.norm(fv) + 1e-8)
 
-                # --- 2. VLAD (Chunked) ---
+                # --- 3. VLAD (Chunked) ---
                 all_idx = []
                 with torch.no_grad():
                     for i in range(0, N, chunk_size):
@@ -130,7 +134,6 @@ class GPUWorker:
                     v = np.sign(v) * np.sqrt(np.abs(v))
                     res[f"vlad_{name}"] = v / (np.linalg.norm(v) + 1e-8)
                 
-                # Vyčištění po jedné variantě (raw/super)
                 del X_full, oh, sum_x_vlad, V
                 torch.cuda.empty_cache()
 
