@@ -1,4 +1,9 @@
-import os, torch, gc, ray
+import os
+import torch
+import gc
+import ray
+import random
+import argparse
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -6,76 +11,67 @@ from pathlib import Path
 from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.mixture import GaussianMixture
-import hnswlib 
-import argparse
+from sklearn.decomposition import PCA
+import hnswlib
 
-# Inicializace Ray - automaticky si vezme dostupné prostředky
-# Vynucené vypnutí starého Raye, pokud existuje
-if ray.is_initialized():
-    ray.shutdown()
+# --- 1. KONFIGURACE ---
+MASTER_SEED = 42
 
-# Inicializace s čistým štítem
-ray.init(num_cpus=16, ignore_reinit_error=True, include_dashboard=False)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
 
-# Malý trik: vyčištění paměti GPU hned na startu
-torch.cuda.empty_cache()
-if torch.cuda.is_available():
-    torch.cuda.ipc_collect()
-# --- 1. POMOCNÉ FUNKCE (Čtení a Sousedé na CPU) ---
-
-def safe_read_parquet(path):
-    table = pq.read_table(path)
-    coords = np.column_stack([table.column('x_coord').to_numpy(), table.column('y_coord').to_numpy()]).astype(np.float32)
-    embs_all = np.vstack(table.column('embedding').to_numpy()).astype(np.float32)
-    if embs_all.ndim == 3: embs_all = embs_all.reshape(-1, embs_all.shape[-1])
-    min_len = min(len(embs_all), len(coords))
-    return coords[:min_len], embs_all[:min_len]
-
-def create_super_tiles_cpu(coords, embs, k=10):
-    if len(coords) < k: return embs
+# --- 2. PROSTOROVÁ AGREGACE (CPU) ---
+def create_hierarchical_super_tiles(coords, embs, k_local=10, k_global=50):
+    if len(coords) < k_global: return embs
     N, D = coords.shape
-    index = hnswlib.Index(space='l2', dim=D)
+    index = hnswlib.Index(space='l2', dim=coords.shape[1])
     index.init_index(max_elements=N, ef_construction=100, M=16)
     index.add_items(coords)
-    indices, _ = index.knn_query(coords, k=k)
-    return np.mean(embs[indices], axis=1).astype(np.float32)
+    
+    # Lokální (detail)
+    idx_l, dist_l = index.knn_query(coords, k=k_local)
+    w_l = np.exp(-dist_l / (2 * np.mean(dist_l) + 1e-8))
+    w_l /= np.sum(w_l, axis=1, keepdims=True)
+    loc_e = np.sum(embs[idx_l] * w_l[:, :, np.newaxis], axis=1)
+    
+    # Globální (architektura)
+    idx_g, dist_g = index.knn_query(coords, k=k_global)
+    w_g = np.exp(-dist_g / (2 * np.mean(dist_g) + 1e-8))
+    w_g /= np.sum(w_g, axis=1, keepdims=True)
+    glob_e = np.sum(embs[idx_g] * w_g[:, :, np.newaxis], axis=1)
+    
+    return (0.4 * loc_e + 0.6 * glob_e).astype(np.float32)
 
-# --- 2. RAY WORKERS (Paralelní části) ---
-
-@ray.remote(num_cpus=2) # Načítání a HNSW na CPU
-def load_and_prepare(f_path, out_dir):
+@ray.remote(num_cpus=2)
+def load_and_prepare_worker(f_path):
     try:
         slide_id = os.path.basename(f_path).replace("slide_id=", "")
-        out_path = Path(out_dir) / f"{slide_id.replace('/', '_')}.parquet"
-        if out_path.exists(): return "Skip"
-
-        # Načtení všech parquetů ve složce slidu
         p_files = list(Path(f_path).glob("*.parquet"))
         if not p_files: return None
-
-        c_list, e_list = [], []
+        c_l, e_l = [], []
         for pf in p_files:
-            c, e = safe_read_parquet(pf)
-            c_list.append(c); e_list.append(e)
-        
-        coords = np.concatenate(c_list)
-        data = np.concatenate(e_list)
-        
-        # Sousedé bleskově na CPU
-        data_super = create_super_tiles_cpu(coords, data)
-        return slide_id, data, data_super, out_path
-    except Exception as e:
-        return f"Error: {e}"
+            t = pq.read_table(pf)
+            c_l.append(np.column_stack([t.column('x_coord').to_numpy(), t.column('y_coord').to_numpy()]).astype(np.float32))
+            e_l.append(np.vstack(t.column('embedding').to_numpy()).astype(np.float32))
+        c, e = np.concatenate(c_l), np.concatenate(e_l)
+        return slide_id, e, create_hierarchical_super_tiles(c, e)
+    except Exception as e: return f"Error: {e}"
 
+# --- 3. KOMPLEXNÍ GPU AGREGÁTOR ---
 @ray.remote(num_gpus=1)
-class GPUWorker:
-    def __init__(self, gmm_params, vlad_centers):
+class FullGPUWorker:
+    def __init__(self, pca_comps, pca_mean, gmm_params, vlad_centers):
         self.device = torch.device("cuda")
+        self.pca_comps = torch.from_numpy(pca_comps).to(self.device)
+        self.pca_mean = torch.from_numpy(pca_mean).to(self.device)
         m, c, p = gmm_params
-        self.m = torch.from_numpy(m).to(self.device)
-        self.c = torch.from_numpy(c).to(self.device) + 1e-6
-        self.p = torch.from_numpy(p).to(self.device)
-        self.vlad_centers = torch.from_numpy(vlad_centers).to(self.device)
+        self.gmm_m = torch.from_numpy(m).to(self.device)
+        self.gmm_c = torch.from_numpy(c).to(self.device) + 1e-6
+        self.vlad_c = torch.from_numpy(vlad_centers).to(self.device)
 
     def compute_slide(self, slide_id, data_raw, data_super, out_path):
         try:
@@ -118,18 +114,17 @@ class GPUWorker:
                 # --- 3. VLAD (Chunked) ---
                 all_idx = []
                 with torch.no_grad():
-                    for i in range(0, N, chunk_size):
-                        X = X_full[i : i + chunk_size]
-                        dists = torch.cdist(X, self.vlad_centers)
-                        all_idx.append(torch.argmin(dists, dim=1))
-                    
-                    idx = torch.cat(all_idx)
-                    oh = torch.nn.functional.one_hot(idx, num_classes=K_vlad).float()
-                    
-                    sum_x_vlad = torch.matmul(oh.t(), X_full)
-                    counts = oh.sum(dim=0).unsqueeze(1)
-                    V = sum_x_vlad - (counts * self.vlad_centers)
-                    
+                    salience = torch.norm(X_norm - torch.mean(X_norm, dim=0), dim=1)
+                    weights = torch.softmax(salience / 0.02, dim=0)
+                    emb = torch.sum(X_norm * weights.unsqueeze(1), dim=0).cpu().numpy()
+                    res[f"ultimate_boost_{name}"] = emb / (np.linalg.norm(emb) + 1e-8)
+
+                # 3. VLAD
+                with torch.no_grad():
+                    dists = torch.cdist(X_norm, self.vlad_c)
+                    idx = torch.argmin(dists, dim=1)
+                    oh = torch.nn.functional.one_hot(idx, num_classes=self.vlad_c.shape[0]).float()
+                    V = torch.matmul(oh.t(), X_norm) - (oh.sum(dim=0).unsqueeze(1) * self.vlad_c)
                     v = V.flatten().cpu().numpy()
                     v = np.sign(v) * np.sqrt(np.abs(v))
                     res[f"vlad_{name}"] = v / (np.linalg.norm(v) + 1e-8)
@@ -138,84 +133,40 @@ class GPUWorker:
                 torch.cuda.empty_cache()
 
             pd.DataFrame([res]).to_parquet(out_path)
-            return f"Done: {slide_id}"
-            
-        except Exception as e:
-            # Pokud se stane chyba, zkusíme aspoň vyčistit VRAM pro další slide
-            torch.cuda.empty_cache()
-            return f"GPU Error {slide_id}: {str(e)}"
-# --- 3. HLAVNÍ LOGIKA ---
+            return True
+        except Exception as e: return str(e)
 
-def compute(input_dir, output_dir):
-    print(f"\n--- RAY PIPELINE START: {input_dir} ---")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    all_folders = sorted([str(f) for f in Path(input_dir).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
-    
-    # TRÉNINK (CPU)
-    sample_list = []
-    for f in all_folders[:50]:
-        p_files = list(Path(f).glob("*.parquet"))
-        if p_files:
-            _, e = safe_read_parquet(p_files[0])
-            e = e / (np.linalg.norm(e, axis=1, keepdims=True) + 1e-8)
-            sample_list.append(e[np.random.choice(len(e), min(2000, len(e)), replace=False)])
-    
-    all_sample = np.concatenate(sample_list)
-    v_m = MiniBatchKMeans(n_clusters=64, batch_size=1024, n_init=1).fit(all_sample)
-    g = GaussianMixture(n_components=32, covariance_type='diag', max_iter=100).fit(all_sample)
-    
-    gmm_params = (g.means_.astype(np.float32), g.covariances_.astype(np.float32), g.weights_.astype(np.float32))
-    vlad_centers = v_m.cluster_centers_.astype(np.float32)
-    
-    # Inicializace GPU herce
-    worker = GPUWorker.remote(gmm_params, vlad_centers)
-
-    # 1. Spustíme VŠECHNY loadery naráz (Ray si je bude dávkovat podle CPU jader)
-    # Každý loader si vezme 2 CPU (podle @ray.remote(num_cpus=2))
-    loader_futures = [load_and_prepare.remote(f, output_dir) for f in all_folders]
-
-    # 2. Použijeme ray.wait, abychom brali to, co je zrovna hotové
-    with tqdm(total=len(all_folders), desc="Pipeline") as pbar:
-        while loader_futures:
-            # Vezmeme slidy, které už CPU dožvýkalo (vratí jeden hotový a zbytek čekajících)
-            ready_list, loader_futures = ray.wait(loader_futures, num_returns=1)
-            
-            result = ray.get(ready_list[0])
-            if isinstance(result, tuple): # Úspěšně načteno a HNSW hotovo
-                s_id, raw, sup, out_p = result
-                # GPU teď dostane "čistou práci" bez čekání na disk
-                # Tady ray.get() necháme, aby GPU jelo jeden po druhém a nepřeplnilo VRAM
-                status = ray.get(worker.compute_slide.remote(s_id, raw, sup, out_p))
-                print(status)
-            else:
-                print(result) # Může být "Skip" nebo chyba načítání
-
-            pbar.update(1)
-
+# --- 4. MAIN ---
 def main():
-    parser = argparse.ArgumentParser(
-        description="Creates tile and slide embeddings for WSI"
-    )
-    
-    parser.add_argument(
-        '--slide-path', 
-        type=str, 
-        required=True,
-        help='Absolute path to WSI. can be an directory with WSIs.'
-    )
-    
-    parser.add_argument(
-        '--save-path', 
-        type=str, 
-        default='./',
-        help='Path for saving parquet files, folder for each WSI will be created automatically.'
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--slide-path', type=str, required=True)
+    parser.add_argument('--save-path', type=str, required=True)
     args = parser.parse_args()
+    set_seed(MASTER_SEED)
+    ray.init(num_cpus=16)
 
-    input_path = args.slide_path.rstrip("/")
-    output_path = args.save_path.rstrip("/")
-    compute(input_path, output_path)
+    all_folders = sorted([str(f) for f in Path(args.slide_path).iterdir() if f.is_dir() and f.name.startswith("slide_id=")])
+    
+    print("--- Fáze 1: Načítání a Hierarchický Pooling ---")
+    loaded_data = [r for r in ray.get([load_and_prepare_worker.remote(f) for f in all_folders]) if isinstance(r, tuple)]
+
+    print("--- Fáze 2: Trénink slovníků (PCA, GMM, KMeans) ---")
+    sample = np.concatenate([d[1][np.random.choice(len(d[1]), min(500, len(d[1])), replace=False)] for d in loaded_data[:40]])
+    pca = PCA(n_components=128, random_state=MASTER_SEED).fit(sample)
+    sample_pca = pca.transform(sample)
+    sample_pca /= (np.linalg.norm(sample_pca, axis=1, keepdims=True) + 1e-8)
+    
+    vlad_centers = MiniBatchKMeans(n_clusters=64, n_init=1, random_state=MASTER_SEED).fit(sample_pca).cluster_centers_
+    gmm = GaussianMixture(n_components=32, covariance_type='diag', random_state=MASTER_SEED).fit(sample_pca)
+    gmm_params = (gmm.means_.astype(np.float32), gmm.covariances_.astype(np.float32), gmm.weights_.astype(np.float32))
+
+    print("--- Fáze 3: GPU Produkce všech metod ---")
+    worker = FullGPUWorker.remote(pca.components_.astype(np.float32), pca.mean_.astype(np.float32), gmm_params, vlad_centers.astype(np.float32))
+    
+    save_dir = Path(args.save_path)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    for s_id, raw, sup in tqdm(loaded_data):
+        ray.get(worker.compute_slide.remote(s_id, raw, sup, save_dir / f"{s_id}.parquet"))
 
 if __name__ == "__main__":
     main()
