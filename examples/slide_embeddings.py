@@ -135,7 +135,7 @@ def main():
             n_components=32, 
             covariance_type='diag', 
             random_state=current_seed,
-            reg_covar=1e-4
+            reg_covar=1e-3
         ).fit(s_pca)
         gmm_p = (gmm.means_.astype(np.float32), gmm.covariances_.astype(np.float32), gmm.weights_.astype(np.float32))
 
