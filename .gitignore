@@ -13,3 +13,4 @@ wheels/
 outputs/
 
 .ipynb_checkpoints
+results_scaling/
