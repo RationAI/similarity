@@ -337,12 +337,13 @@ def parse_args() -> Config:
 def main() -> None:
     config = parse_args()
 
-    ray.init(logging_level=logging.ERROR, configure_logging=True, object_store_memory=10 * 1024**3)
+    ray.init(logging_level=logging.ERROR, configure_logging=True, object_store_memory=50 * 1024**3)
 
     # to not spill on disk and slow down whole computation
     ctx = ray.data.DataContext.get_current()
-    ctx.execution_options.max_pending_blocks = 50 
+    ctx.execution_options.max_pending_blocks = 20
     ctx.execution_options.spill_threshold = 0.99
+    ctx.prefetch_capacity = 20
 
     try:
         start_time = time.time()
@@ -377,8 +378,7 @@ def main() -> None:
             ray.shutdown()
             return
 
-        total_cpus = 22
-        cpus_concurrency = 10 # for data reading
+        cpus_concurrency = 20 # for data reading
 
         ds = ds.flat_map(tiling)
         ds = ds.map_batches(read_slide_tiles, batch_size=128, num_cpus=1, concurrency=cpus_concurrency)
@@ -392,7 +392,7 @@ def main() -> None:
                 "ENCODER": config.encoder},
             compute=ray.data.ActorPoolStrategy(size=10),
             num_cpus=1,
-            batch_size=128
+            batch_size=32
         )
 
         # --- 2. GPU INFERENCE (1 worker na H100) ---
@@ -405,8 +405,8 @@ def main() -> None:
             },
             compute=ray.data.ActorPoolStrategy(size=1),
             num_gpus=1,
-            num_cpus=1,
-            batch_size=128
+            num_cpus=4,
+            batch_size=256
         )
 
         results.write_parquet(
