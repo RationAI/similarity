@@ -56,7 +56,7 @@ def evaluate_attack_fast(orig_embs, gen_embs, gen_pids, orig_pids):
 
 def main():
     root_path = "/data/fs201053/jb88526/reidentification_test_complete_v2"
-    output_dir = Path("data/results_scaling")
+    output_dir = Path("/home/jb88526/similarity/data")
     output_dir.mkdir(exist_ok=True)
 
     encoders = ["gigapath", "virchow2", "uni2h", "midnight12k", "simclrv2"]
