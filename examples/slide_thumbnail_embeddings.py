@@ -9,17 +9,30 @@ from openslide import OpenSlide
 from PIL import Image
 from pathlib import Path
 import urllib.parse
-
-# --- KONFIGURACE ---
-INPUT_PATH = "/data/fs201053/bs37803/annoPaperScanns"
-SAVE_PATH = "./tissue_embeddings_full_downscale.parquet"
-PREVIEW_DIR = "./previews_full_downscale"  # Složka pro kontrolu
-DEVICE = "cuda"
-DTYPE = torch.float16
+import argparse
 
 from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k, simclrv2
 
-# --- OPTIMALIZOVANÝ PREDICTOR JAKO ACTOR ---
+def get_args():
+    parser = argparse.ArgumentParser(description="Extrakce embeddingů z celých slidů (full downscale).")
+    
+    # Cesty
+    parser.add_argument("--input", type=str, required=True,
+                        help="Cesta ke složce se slidy.")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Cesta pro uložení výsledného Parquet souboru.")
+    
+    # Hardware / Ray
+    parser.add_argument("--cpus", type=int, default=16, help="Počet CPU jader pro Ray.")
+    parser.add_argument("--gpus", type=int, default=1, help="Počet GPU pro Ray.")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size pro inference.")
+    
+    return parser.parse_args()
+
+# Globální proměnné pro Predictor (budou nastaveny v main)
+DEVICE = "cuda"
+DTYPE = torch.float16
+
 class EmbeddingPredictor:
     def __init__(self):
         self.device = torch.device(DEVICE)
@@ -55,26 +68,14 @@ class EmbeddingPredictor:
                     new_batch[f"emb_{name}"].append(emb.cpu().numpy().astype(np.float32).flatten())
         return new_batch
 
-# --- CPU FUNKCE PRO RYCHLÝ DOWNSCALE + UKÁZKY ---
 def process_full_downscale(row: dict):
     path = row["item"]
     try:
         slide = OpenSlide(path)
-        
-        # Bleskové načtení celého obrazu
         full_img = slide.get_thumbnail((224, 224)).convert('RGB')
         
         if full_img.size != (224, 224):
             full_img = full_img.resize((224, 224), Image.BILINEAR)
-
-        # --- UKÁZKY ---
-        # Uložíme náhled, pokud index (vytvořený z názvu) odpovídá vzorku
-        # Abychom neukládali tisíce souborů, uložíme jen prvních 10 unikátních slidů
-        # (Využijeme jednoduchý globální counter v rámci workeru není možný, tak použijeme náhodu)
-        if np.random.rand() < 0.05: # Uloží cca 5% všech slidů pro kontrolu
-            os.makedirs(PREVIEW_DIR, exist_ok=True)
-            safe_name = urllib.parse.quote(path, safe="").replace("%", "_")[-60:]
-            full_img.save(os.path.join(PREVIEW_DIR, f"{safe_name}_full.png"))
 
         return [{
             "slide_id": path,
@@ -85,31 +86,33 @@ def process_full_downscale(row: dict):
         return []
 
 def main():
+    args = get_args()
+
     if not ray.is_initialized():
-        ray.init(num_cpus=44, num_gpus=1)
+        ray.init(num_cpus=args.cpus, num_gpus=args.gpus)
     
-    if not os.path.exists(PREVIEW_DIR):
-        os.makedirs(PREVIEW_DIR)
 
     exts = {".svs", ".tiff", ".mrxs", ".ndpi"}
-    all_paths = [str(p) for p in Path(INPUT_PATH).rglob("*") if p.suffix.lower() in exts]
-    print(f"Nalezeno {len(all_paths)} slidů. Ukládám ukázky do {PREVIEW_DIR}")
+    all_paths = [str(p) for p in Path(args.input).rglob("*") if p.suffix.lower() in exts]
+    print(f"Nalezeno {len(all_paths)} slidů.")
 
     ds = ray.data.from_items(all_paths)
     
-    # 1. CPU část (Thumbnailing)
-    ds = ds.flat_map(process_full_downscale)
-    
-    # 2. GPU část (Inference)
-    results = ds.map_batches(
-        EmbeddingPredictor,
-        batch_size=16, 
-        num_gpus=1,
-        concurrency=1 
+    # 1. CPU část - předáváme argumenty pomocí fn_args
+    ds = ds.flat_map(
+        process_full_downscale
     )
     
-    results.write_parquet(SAVE_PATH)
-    print(f"Hotovo. Výsledky uloženy do: {SAVE_PATH}")
+    # 2. GPU část
+    results = ds.map_batches(
+        EmbeddingPredictor,
+        batch_size=args.batch_size, 
+        num_gpus=args.gpus,
+        concurrency=args.gpus # Typicky chceme 1 instanci modelu na 1 GPU
+    )
+    
+    results.write_parquet(args.output)
+    print(f"Hotovo. Výsledky uloženy do: {args.output}")
 
 if __name__ == "__main__":
     main()
