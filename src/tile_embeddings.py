@@ -1,3 +1,4 @@
+import openslide
 import torch
 import ray
 import os
@@ -92,11 +93,11 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
             stride=(row["stride_x"], row["stride_y"]),
             last="keep",
         )
+        if (x, y) >= (512, 512)
     ]
 
 def get_processing_tasks(config: Config):
-    tasks = []
-    tiff_tasks = []
+    tasks = [] # Jeden seznam pro všechno
     input_path = Path(config.slide_path)
     output_base = Path(config.save_path)
     extensions = {".svs", ".tiff", ".mrxs"}
@@ -104,26 +105,27 @@ def get_processing_tasks(config: Config):
     if input_path.is_dir():
         for path in input_path.rglob("*"):
             if path.suffix.lower() in extensions and "_COPY" not in path.name:
-                
                 slide_id_val = urllib.parse.quote(str(path), safe="")
-                
                 check_dir = output_base / f"slide_id={slide_id_val}"
-                
                 is_done = check_dir.exists() and any(check_dir.glob("*.parquet"))
                 
                 if not is_done:
                     rel_path = path.relative_to(input_path).parent
                     save_dir = output_base / rel_path
-                    if path.suffix.lower() == ".tiff":
-                        tiff_tasks.append((str(path), str(save_dir)))
-                    else:
-                        tasks.append((str(path), str(save_dir)))
-                else:
-                    print(f"Skipping already processed slide: {path.name}")
-                    pass
 
-    print(f"Total tasks to process: {len(tasks)+len(tiff_tasks)}")
-    return tasks, tiff_tasks
+                    try:
+                        s = openslide.OpenSlide(str(path))
+                        s.read_region((0, 0), 1, (1, 1)) # Test read to confirm it's a valid slide
+                        s.close() # DŮLEŽITÉ: zavřít!
+                    except:
+                        print(f"Chyba při otevírání slide {path}.")
+                        continue
+                    
+                    tasks.append({
+                        "path": str(path), 
+                        "save_dir": str(save_dir)
+                    })
+    return tasks # Vracíme jen jeden seznam
 
 class CPUPreprocessActor:
     def __init__(self, ENCODER=0, NORMALIZE=False, CLAHE=False, RM_BG=False):
@@ -347,32 +349,12 @@ def main() -> None:
 
     try:
         start_time = time.time()
-        tasks, tiff_tasks = get_processing_tasks(config)
-        slide_paths = [t[0] for t in tasks]
-        tiff_paths = [t[0] for t in tiff_tasks]
-
-        print(slide_paths)
-        print(tiff_paths)
+        tasks = get_processing_tasks(config)
+        slide_paths = [t["path"] for t in tasks]
+        print(f"Found {len(slide_paths)} slides to process.")
         
-        ds_slide = None
-        ds_tiff = None
-
         if slide_paths:
-            ds_slide = read_slides(slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
-        if tiff_paths: # I hate you Jakub
-            if config.mpp == 0.5:
-                ds_tiff = read_slides(tiff_paths, level=0, tile_extent=448, stride=448)
-            elif config.mpp == 1.0:
-                ds_tiff = read_slides(tiff_paths, level=0, tile_extent=896, stride=896)
-            else:
-                ds_tiff = read_slides(tiff_paths, level=0, tile_extent=1792, stride=1792)
-
-        if ds_slide and ds_tiff:
-            ds = ds_slide.union(ds_tiff)
-        elif ds_slide:
-            ds = ds_slide
-        elif ds_tiff:
-            ds = ds_tiff
+            ds = read_slides(slide_paths, mpp=config.mpp, tile_extent=config.tile_size, stride=config.tile_size)
         else:
             print("no slides to process.")
             ray.shutdown()
@@ -415,7 +397,7 @@ def main() -> None:
         )
 
         print(f"Finished in {time.time() - start_time:.2f} seconds")
-        print(f"Time per slide: {(time.time() - start_time) / (len(slide_paths) + len(tiff_paths)):.2f} seconds")
+        print(f"Time per slide: {(time.time() - start_time) / len(slide_paths):.2f} seconds")
     finally:
         ray.shutdown()
 

@@ -230,7 +230,8 @@ def main():
                     pass
 
     for run_idx in range(args.num_runs):
-        current_seed = 42 + run_idx
+        current_seed = random.randint(0, 2**32 - 1)
+        print(f"\n>>> Spouštíme RUN {run_idx+1}/{args.num_runs} s náhodným seedem {current_seed}")
         set_seed(current_seed)
         run_save_dir = Path(args.save_path) / f"run_seed_{current_seed}"
         run_save_dir.mkdir(parents=True, exist_ok=True)
