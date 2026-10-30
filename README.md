@@ -88,4 +88,4 @@ Preprocessing toggles for tile embeddings: `--rmbg` (drop non-tissue tiles),
 
 ## Licence
 
-No licence file has been added yet.
+This project is licensed under the [MIT License](LICENSE).
