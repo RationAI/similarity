@@ -6,7 +6,7 @@ fits PCA + K-Means on a representative sample, then computes a power-
 normalised VLAD vector for every slide.
 
 Usage:
-    python vlad_slides.py \
+    python -m src.slide_embeddings_competition \
         --slide-path /data/virchow2_slides \
         --save-path  /data/vlad_output
 """

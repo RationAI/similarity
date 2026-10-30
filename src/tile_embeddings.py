@@ -9,13 +9,10 @@ import time
 import logging
 import ray.data
 from pathlib import Path
-import multiprocessing
 
-from PIL import Image
 from typing import Any
 from ratiopath.ray import read_slides
 from ratiopath.tiling import grid_tiles, read_slide_tiles
-from rationai.staining import StandardConversions, normalize_staining
 from dataclasses import dataclass, asdict
 import urllib.parse
 
@@ -97,7 +94,7 @@ def tiling(row: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 def get_processing_tasks(config: Config):
-    tasks = [] # Jeden seznam pro všechno
+    tasks = []
     input_path = Path(config.slide_path)
     output_base = Path(config.save_path)
     extensions = {".svs", ".tiff", ".mrxs"}
@@ -116,16 +113,16 @@ def get_processing_tasks(config: Config):
                     try:
                         s = openslide.OpenSlide(str(path))
                         s.read_region((0, 0), 1, (1, 1)) # Test read to confirm it's a valid slide
-                        s.close() # DŮLEŽITÉ: zavřít!
-                    except:
-                        print(f"Chyba při otevírání slide {path}.")
+                        s.close()
+                    except Exception:
+                        print(f"Failed to open slide {path}, skipping.")
                         continue
                     
                     tasks.append({
                         "path": str(path), 
                         "save_dir": str(save_dir)
                     })
-    return tasks # Vracíme jen jeden seznam
+    return tasks
 
 class CPUPreprocessActor:
     def __init__(self, ENCODER=0, NORMALIZE=False, CLAHE=False, RM_BG=False):
@@ -377,7 +374,7 @@ def main() -> None:
             batch_size=32
         )
 
-        # --- 2. GPU INFERENCE (1 worker na H100) ---
+        # --- 2. GPU inference (1 worker per H100) ---
         results = ds.map_batches(
             GPUPredictor,
             fn_constructor_kwargs={

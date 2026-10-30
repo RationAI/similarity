@@ -117,7 +117,7 @@ def load_and_prepare_worker(f_path, tmp_dir):
 
         return slide_id, str(save_path)
     except Exception as ex:
-        return f"Error v {f_path}: {ex}"
+        return f"Error in {f_path}: {ex}"
 
 
 @ray.remote(num_gpus=1)
@@ -212,7 +212,7 @@ def main():
     for _ in range(min(MAX_PREPARE_CONCURRENT, len(all_folders))):
         pending.append(load_and_prepare_worker.remote(next(f_iter), tmp_dir))
 
-    with tqdm(total=len(all_folders), desc="Příprava dat") as pbar:
+    with tqdm(total=len(all_folders), desc="Preparing data") as pbar:
         while pending:
             done, pending = ray.wait(pending, num_returns=1)
             for ref in done:
@@ -220,7 +220,7 @@ def main():
                 if isinstance(res, tuple):
                     prepared_paths.append(res)
                 else:
-                    print(f"\Error: {res}")
+                    print(f"\nError: {res}")
                 pbar.update(1)
                 try:
                     pending.append(
@@ -231,12 +231,10 @@ def main():
 
     for run_idx in range(args.num_runs):
         current_seed = random.randint(0, 2**32 - 1)
-        print(f"\n>>> Spouštíme RUN {run_idx+1}/{args.num_runs} s náhodným seedem {current_seed}")
+        print(f"\n>>> Starting run {run_idx+1}/{args.num_runs} with seed {current_seed}")
         set_seed(current_seed)
         run_save_dir = Path(args.save_path) / f"run_seed_{current_seed}"
         run_save_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n>>> RUN {run_idx + 1} (Seed: {current_seed})")
 
         # training PCA/GMM
         sample_list = []
@@ -272,7 +270,7 @@ def main():
             vlad_c.astype(np.float32),
         )
 
-        for s_id, p_path in tqdm(prepared_paths, desc=f"Inference Seed {current_seed}"):
+        for s_id, p_path in tqdm(prepared_paths, desc=f"Inference (seed {current_seed})"):
             out_file = run_save_dir / f"{s_id}.parquet"
             if not out_file.exists():
                 success = ray.get(worker.compute_slide.remote(s_id, p_path, out_file))
