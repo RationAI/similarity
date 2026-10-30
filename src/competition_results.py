@@ -18,10 +18,10 @@ THRESHOLDS = [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30,
 
 def get_retrieved(r, threshold):
     """Set of slide IDs with sim >= threshold."""
-    return set(
+    return {
         sid for sid, s in zip(r["ranked_ids"], r["ranked_scores"])
         if s >= threshold
-    )
+    }
 
 
 def f1(r, threshold):

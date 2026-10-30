@@ -9,8 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
+# Tooling caches
+.ruff_cache/
+
 # hydra
 outputs/
 
-.ipynb_checkpoints
+# Experiment outputs
+.ipynb_checkpoints/
 results_scaling/
+retrieval_results.csv
+submission.csv

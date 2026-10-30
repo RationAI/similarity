@@ -13,16 +13,16 @@ Usage:
 
 import argparse
 import gc
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import ray
 import torch
-import pyarrow.parquet as pq
-from pathlib import Path
-from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Config (override via CLI)

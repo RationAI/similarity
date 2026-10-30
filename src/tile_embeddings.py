@@ -1,22 +1,20 @@
-import openslide
-import torch
-import ray
-import os
 import argparse
-import pandas as pd
-import numpy as np
-import time
 import logging
-import ray.data
+import time
+import urllib.parse
+from dataclasses import asdict, dataclass
 from pathlib import Path
-
 from typing import Any
+
+import numpy as np
+import openslide
+import pandas as pd
+import pandas.errors
+import ray
+import ray.data
+import torch
 from ratiopath.ray import read_slides
 from ratiopath.tiling import grid_tiles, read_slide_tiles
-from dataclasses import dataclass, asdict
-import urllib.parse
-
-import pandas.errors
 
 # For Ray to be happy and not throw error
 if not hasattr(pd.errors, "SettingWithCopyWarning"):
@@ -25,6 +23,7 @@ if not hasattr(pd.errors, "SettingWithCopyWarning"):
     pd.errors.SettingWithCopyWarning = SettingWithCopyWarning
 
 import pandas.core.common as pcc
+
 if not hasattr(pcc, "SettingWithCopyWarning"):
     pcc.SettingWithCopyWarning = pd.errors.SettingWithCopyWarning
 
@@ -126,12 +125,18 @@ def get_processing_tasks(config: Config):
 
 class CPUPreprocessActor:
     def __init__(self, ENCODER=0, NORMALIZE=False, CLAHE=False, RM_BG=False):
-        import torch
         import cv2
         import numpy as np
         from PIL import Image
         from rationai.staining import StandardConversions, normalize_staining
-        from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k, simclrv2
+
+        from src.feature_extractors import (
+            UNI2h,
+            gigapathTile,
+            midnight12k,
+            simclrv2,
+            virchow2,
+        )
 
         self.cv2 = cv2
         self.np = np
@@ -215,9 +220,16 @@ class CPUPreprocessActor:
 
 class GPUPredictor:
     def __init__(self, encoder_idx, device, dtype):
-        import torch
         import numpy as np
-        from src.feature_extractors import gigapathTile, virchow2, UNI2h, midnight12k, simclrv2
+        import torch
+
+        from src.feature_extractors import (
+            UNI2h,
+            gigapathTile,
+            midnight12k,
+            simclrv2,
+            virchow2,
+        )
         self.device = torch.device(device)
         self.dtype = dtype
         self.torch = torch

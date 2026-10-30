@@ -78,7 +78,7 @@ def load_and_prepare_worker(f_path, tmp_dir):
             try:
                 pq.read_metadata(save_path)
                 return slide_id, str(save_path)
-            except:
+            except Exception:
                 save_path.unlink()
 
         p_files = list(Path(f_path).glob("*.parquet"))
@@ -126,7 +126,7 @@ class FullGPUWorker:
         self.device = torch.device("cuda")
         self.pca_comps = torch.from_numpy(pca_comps).to(self.device)
         self.pca_mean = torch.from_numpy(pca_mean).to(self.device)
-        m, c, p = gmm_params
+        m, c = gmm_params
         self.gmm_m = torch.from_numpy(m).to(self.device)
         self.gmm_c = torch.from_numpy(c).to(self.device)
         self.vlad_c = torch.from_numpy(vlad_centers).to(self.device)
@@ -260,7 +260,6 @@ def main():
         gmm_p = (
             gmm.means_.astype(np.float32),
             gmm.covariances_.astype(np.float32),
-            gmm.weights_.astype(np.float32),
         )
 
         worker = FullGPUWorker.remote(

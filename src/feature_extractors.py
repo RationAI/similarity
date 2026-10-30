@@ -1,9 +1,9 @@
 import timm
+import torch
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
 from timm.layers import SwiGLUPacked
-import torch
-import torch.nn as nn
+from torch import nn
 from torchvision import transforms
 from torchvision.transforms import v2
 from transformers import AutoModel

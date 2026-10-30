@@ -7,7 +7,6 @@ slide above the similarity threshold as the predicted match set.
 import argparse
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from src.retrieval import load_embeddings, rank_gallery, report_missing

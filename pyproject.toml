@@ -24,7 +24,6 @@ dependencies = [
     "gigapath @ git+https://github.com/jiribuchta/prov-gigapath.git@main",
     "rationai-staining @ git+ssh://git@gitlab.ics.muni.cz/rationai/digital-pathology/libraries/staining.git",
     "seaborn==0.13.2",
-    "matplotlib==3.10.8",
     "hydra-core==1.3.2",
     "scikit-learn==1.7.2",
     "hnswlib==0.8.0",
