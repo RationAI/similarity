@@ -1,8 +1,16 @@
-# RationAI Slide Similarity
+# similarity
 
-Whole-slide-image (WSI) similarity pipeline: embed whole-slide images with
-pathology foundation models and aggregate tile embeddings into fixed-length
-slide descriptors for retrieval and re-identification experiments.
+Linkage attacks on whole-slide images (WSIs): given a slide, find the slides of the same patient by comparing image features.
+The code was written by [RationAI](https://github.com/RationAI) (Masaryk University) and partners for **PRIVAGAMS**, a project funded in the 1st OSCARS Open Call (grant agreement No. 101129751), and for the public challenge [Benchmarking WSI Privacy](https://www.kaggle.com/competitions/benchmarking-wsi-privacy).
+
+## What is where
+
+| Path | Content |
+| --- | --- |
+| `src/` | Slide-similarity pipeline: tile embeddings (pathology foundation models) aggregated into slide-level descriptors (mean pooling, Fisher vectors, VLAD) for retrieval and re-identification experiments. |
+| `notebooks/analyze.ipynb` | Embedding-quality analysis: re-identification rates, cross-scanner robustness, preprocessing and mpp impact, scaling. |
+| `memorisation/` | Memorisation audit of synthetic patches against training tiles (UNI2-h features, FAISS), and an edge-based near-duplicate check. See its README. |
+| `steganography/` | Script that hides one image inside another. See its README. |
 
 ## Pipeline
 
@@ -34,6 +42,18 @@ slide descriptors for retrieval and re-identification experiments.
 
 Weights are downloaded from the Hugging Face Hub on first use.
 
+## Installation
+
+Python 3.12 or newer. The dependencies are in `pyproject.toml` and locked in `uv.lock`:
+
+```sh
+uv sync
+```
+
+OpenSlide and libvips must be installed on the system. The `memorisation/`
+scripts are standalone and document their own dependencies (FAISS, `fire`,
+…); they are not part of the `similarity` package.
+
 ## Setup (Musica cluster)
 
 ```
@@ -60,11 +80,12 @@ Preprocessing toggles for tile embeddings: `--rmbg` (drop non-tissue tiles),
 `--normalize` (stain normalization), `--clahe` (contrast enhancement),
 `--mpp` (tiling resolution, default 0.5 = 20×), `--overwrite`.
 
-## Repository layout
+## Related resources
 
-```
-src/tile_embeddings.py     # WSI -> tile embeddings
-src/slide_embeddings.py    # tile -> slide descriptors
-src/feature_extractors.py  # encoder zoo
-notebooks/analyze.ipynb    # embedding-quality analysis
-```
+- Challenge: <https://www.kaggle.com/competitions/benchmarking-wsi-privacy>
+- Challenge data: BBMRI-ERIC WSI archive, <https://cbioportal.wsi-archive.bbmri-eric.eu/archive/> (Life Science Login required).
+- Risk assessment this code builds on: J. Buchta, *Assessing Privacy Risks in Real and Synthetic Whole-Slide Images via Foundation Models*, diploma thesis, Masaryk University, 2026, which extends Holub et al., *Privacy risks of whole-slide image sharing in digital pathology*, Nature Communications 14, 2577 (2023), <https://doi.org/10.1038/s41467-023-37991-y>.
+
+## Licence
+
+No licence file has been added yet.
