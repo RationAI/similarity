@@ -1,7 +1,7 @@
 [project]
 name = "similarity"
 version = "0.1.0"
-description = ""
+description = "Whole-slide image similarity: tile and slide embeddings for retrieval and re-identification experiments"
 readme = "README.md"
 requires-python = "==3.12.9"
 dependencies = [

@@ -18,5 +18,3 @@ outputs/
 # Experiment outputs
 .ipynb_checkpoints/
 results_scaling/
-retrieval_results.csv
-submission.csv
