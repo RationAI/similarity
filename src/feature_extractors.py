@@ -23,9 +23,16 @@ class Virchow2Wrapper(nn.Module):
 
 
 def virchow2():
-    model = timm.create_model("hf-hub:paige-ai/Virchow2", pretrained=True, mlp_layer=SwiGLUPacked, act_layer=torch.nn.SiLU)
+    model = timm.create_model(
+        "hf-hub:paige-ai/Virchow2",
+        pretrained=True,
+        mlp_layer=SwiGLUPacked,
+        act_layer=torch.nn.SiLU,
+    )
     wrapped_model = Virchow2Wrapper(model)
-    transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
+    transform = create_transform(
+        **resolve_data_config(model.pretrained_cfg, model=model)
+    )
     return wrapped_model, transform
 
 
@@ -43,16 +50,27 @@ class UNI2hWrapper(nn.Module):
 
 def UNI2h():
     timm_kwargs = {
-        'img_size': 224, 'patch_size': 14, 'depth': 24, 'num_heads': 24,
-        'init_values': 1e-5, 'embed_dim': 1536, 'mlp_ratio': 2.66667*2,
-        'num_classes': 0, 'no_embed_class': True,
-        'mlp_layer': timm.layers.SwiGLUPacked,
-        'act_layer': torch.nn.SiLU,
-        'reg_tokens': 8, 'dynamic_img_size': True
+        "img_size": 224,
+        "patch_size": 14,
+        "depth": 24,
+        "num_heads": 24,
+        "init_values": 1e-5,
+        "embed_dim": 1536,
+        "mlp_ratio": 2.66667 * 2,
+        "num_classes": 0,
+        "no_embed_class": True,
+        "mlp_layer": timm.layers.SwiGLUPacked,
+        "act_layer": torch.nn.SiLU,
+        "reg_tokens": 8,
+        "dynamic_img_size": True,
     }
-    model = timm.create_model("hf-hub:MahmoodLab/UNI2-h", pretrained=True, **timm_kwargs)
+    model = timm.create_model(
+        "hf-hub:MahmoodLab/UNI2-h", pretrained=True, **timm_kwargs
+    )
     wrapped_model = UNI2hWrapper(model)
-    transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
+    transform = create_transform(
+        **resolve_data_config(model.pretrained_cfg, model=model)
+    )
     return wrapped_model, transform
 
 
@@ -71,10 +89,12 @@ class GigaPathWrapper(nn.Module):
 def gigapathTile():
     model = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
     wrapped_model = GigaPathWrapper(model)
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ]
+    )
     return wrapped_model, transform
 
 
@@ -96,13 +116,13 @@ class MidnightWrapper(nn.Module):
 def midnight12k() -> nn.Module:
     """This model expects 224x224 tiles"""
     transform = v2.Compose(
-    [
-        v2.ToImage(),
-        v2.ToDtype(torch.float32, scale=True),
-        v2.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ]
+        [
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ]
     )
-    model = AutoModel.from_pretrained('kaiko-ai/midnight')
+    model = AutoModel.from_pretrained("kaiko-ai/midnight")
     wrapped_model = MidnightWrapper(model)
     return wrapped_model, transform
 
@@ -112,13 +132,19 @@ def simclrv2() -> nn.Module:
     SimCLRv2 (ResNet152x4) implementation based on the Nature article.
     Expects 224x224 tiles and uses 100% fine-tuned labels.
     """
-    model = timm.create_model("hf-hub:timm/resnetv2_152x4_bit.goog_in21k_ft_in1k", pretrained=True, num_classes=0)
+    model = timm.create_model(
+        "hf-hub:timm/resnetv2_152x4_bit.goog_in21k_ft_in1k",
+        pretrained=True,
+        num_classes=0,
+    )
     model.eval()
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ]
+    )
 
     return model, transform

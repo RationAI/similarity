@@ -78,7 +78,7 @@ def load_and_prepare_worker(f_path, tmp_dir):
             try:
                 pq.read_metadata(save_path)
                 return slide_id, str(save_path)
-            except Exception:
+            except Exception:  # noqa: BLE001 - corrupt cache file, just rebuild it
                 save_path.unlink()
 
         p_files = list(Path(f_path).glob("*.parquet"))
@@ -116,7 +116,7 @@ def load_and_prepare_worker(f_path, tmp_dir):
         gc.collect()
 
         return slide_id, str(save_path)
-    except Exception as ex:
+    except Exception as ex:  # noqa: BLE001 - Ray worker must not crash the pipeline
         return f"Error in {f_path}: {ex}"
 
 
@@ -178,7 +178,7 @@ class FullGPUWorker:
 
             pd.DataFrame([res]).to_parquet(out_path)
             return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - GPU worker must not crash the pipeline
             return str(e)
 
 
@@ -231,7 +231,9 @@ def main():
 
     for run_idx in range(args.num_runs):
         current_seed = random.randint(0, 2**32 - 1)
-        print(f"\n>>> Starting run {run_idx+1}/{args.num_runs} with seed {current_seed}")
+        print(
+            f"\n>>> Starting run {run_idx + 1}/{args.num_runs} with seed {current_seed}"
+        )
         set_seed(current_seed)
         run_save_dir = Path(args.save_path) / f"run_seed_{current_seed}"
         run_save_dir.mkdir(parents=True, exist_ok=True)
@@ -269,7 +271,9 @@ def main():
             vlad_c.astype(np.float32),
         )
 
-        for s_id, p_path in tqdm(prepared_paths, desc=f"Inference (seed {current_seed})"):
+        for s_id, p_path in tqdm(
+            prepared_paths, desc=f"Inference (seed {current_seed})"
+        ):
             out_file = run_save_dir / f"{s_id}.parquet"
             if not out_file.exists():
                 success = ray.get(worker.compute_slide.remote(s_id, p_path, out_file))
